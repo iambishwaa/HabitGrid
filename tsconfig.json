@@ -1,0 +1,17 @@
+{
+  "extends": "@tsconfig/svelte/tsconfig.json",
+  "compilerOptions": {
+    "moduleResolution": "bundler",
+    "target": "ES2018",
+
+    "module": "ESNext",
+    "importHelpers": true,
+    "isolatedModules": true,
+    "strictNullChecks": true,
+    "verbatimModuleSyntax": true,
+    "lib": ["ES6", "DOM"],
+    "allowImportingTsExtensions": true,
+    "noEmit": true
+  },
+  "include": ["src/**/*.ts", "src/**/*.d.ts", "src/**/*.svelte"]
+}
