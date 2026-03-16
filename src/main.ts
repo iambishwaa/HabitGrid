@@ -54,12 +54,24 @@ const HABIT_TRACKER_ICON = `
 
 export default class HabitTrackerPlugin extends Plugin {
 	settings: HabitTrackerSettings = DEFAULT_SETTINGS;
-
-	/**
-	 * The single DataManager instance shared across the whole plugin.
-	 * Both HabitTrackerView and Svelte components receive this via props.
-	 */
 	dataManager!: DataManager;
+
+	// ── Cross-instance event bus ──────────────────────────────────────────
+	// Any HabitTrackerApp that writes data calls onDataChanged().
+	// All other open instances subscribe and reload their habits array.
+
+	private _listeners: Array<() => void> = [];
+
+	onDataChanged(): void {
+		this._listeners.forEach((fn) => fn());
+	}
+
+	onDataChangedSubscribe(fn: () => void): () => void {
+		this._listeners.push(fn);
+		return () => {
+			this._listeners = this._listeners.filter((f) => f !== fn);
+		};
+	}
 
 	// ── onload ─────────────────────────────────────────────────────────────
 
@@ -83,7 +95,7 @@ export default class HabitTrackerPlugin extends Plugin {
 		);
 
 		// 5. Add the ribbon icon that opens / focuses the view
-		this.addRibbonIcon("habit-tracker", "Habit Tracker", async () => {
+		this.addRibbonIcon("habit-tracker", "HabitGrid", async () => {
 			await this.activateView();
 		});
 
@@ -115,12 +127,33 @@ export default class HabitTrackerPlugin extends Plugin {
 	// ── Commands ────────────────────────────────────────────────────────────
 
 	private registerCommands(): void {
-		// ── Open / focus the tracker panel ──
 		this.addCommand({
 			id: "open-habit-tracker",
-			name: "Open Habit Tracker",
+			name: "HabitGrid — Open (large view)",
 			icon: "habit-tracker",
 			callback: () => this.activateView(),
+		});
+
+		this.addCommand({
+			id: "open-habit-tracker-new",
+			name: "HabitGrid — Open new instance",
+			icon: "habit-tracker",
+			callback: () => this.openNewInstance(),
+		});
+
+		this.addCommand({
+			id: "open-habit-tracker-sidebar",
+			name: "HabitGrid — Open in sidebar",
+			icon: "habit-tracker",
+			callback: async () => {
+				const leaf = this.app.workspace.getRightLeaf(false);
+				if (!leaf) return;
+				await leaf.setViewState({
+					type: VIEW_TYPE_HABIT_TRACKER,
+					active: true,
+				});
+				this.app.workspace.revealLeaf(leaf);
+			},
 		});
 
 		// ── Create a new habit via the modal ──
@@ -216,15 +249,17 @@ export default class HabitTrackerPlugin extends Plugin {
 	 */
 	async activateView(): Promise<void> {
 		const { workspace } = this.app;
+		// Always open a fresh tab — same behaviour as openNewInstance
+		const leaf = workspace.getLeaf("tab");
+		await leaf.setViewState({
+			type: VIEW_TYPE_HABIT_TRACKER,
+			active: true,
+		});
+		workspace.revealLeaf(leaf);
+	}
 
-		// If already open anywhere, just focus it
-		const existing = workspace.getLeavesOfType(VIEW_TYPE_HABIT_TRACKER);
-		if (existing.length > 0) {
-			workspace.revealLeaf(existing[0]);
-			return;
-		}
-
-		// Open as a new tab in the main editor area (not sidebar)
+	async openNewInstance(): Promise<void> {
+		const { workspace } = this.app;
 		const leaf = workspace.getLeaf("tab");
 		await leaf.setViewState({
 			type: VIEW_TYPE_HABIT_TRACKER,
@@ -242,15 +277,9 @@ export default class HabitTrackerPlugin extends Plugin {
 		const leaves = this.app.workspace.getLeavesOfType(
 			VIEW_TYPE_HABIT_TRACKER,
 		);
-		if (leaves.length === 0) {
-			// Don't force-open on cold start; let user open it themselves
-			return;
-		}
-		// View exists from a previous session — refresh its content
 		for (const leaf of leaves) {
-			const view = leaf.view;
-			if (view instanceof HabitTrackerView) {
-				view.refresh();
+			if (leaf.view instanceof HabitTrackerView) {
+				leaf.view.refresh();
 			}
 		}
 	}

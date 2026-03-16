@@ -34,7 +34,7 @@ export class HabitTrackerView extends ItemView {
 	}
 
 	getDisplayText(): string {
-		return "Habit Tracker";
+		return "HabitGrid";
 	}
 
 	getIcon(): string {
@@ -48,6 +48,11 @@ export class HabitTrackerView extends ItemView {
 		const container = this.containerEl.children[1] as HTMLElement;
 		container.empty();
 		container.addClass("habit-tracker-root");
+
+		// Strip Obsidian's default .view-content padding (15px / 30px)
+		// so our layout controls all spacing with no external interference.
+		container.style.padding = "0";
+		container.style.overflow = "hidden";
 
 		this.svelteApp = new HabitTrackerApp({
 			target: container,

@@ -1,11 +1,11 @@
 {
-  "id": "habit-tracker",
-  "name": "Habit Tracker",
-  "version": "0.1.0",
-  "minAppVersion": "1.4.0",
-  "description": "GitHub-style heatmap habit tracking directly in your vault — with Daily Note sync and streak analytics.",
-  "author": "You",
-  "authorUrl": "",
-  "fundingUrl": "",
-  "isDesktopOnly": false
+	"id": "habitgrid-by-bishwaa",
+	"name": "HabitGrid",
+	"version": "0.1.0",
+	"minAppVersion": "1.4.0",
+	"description": "GitHub-style heatmap habit tracking directly in your vault — with Daily Note sync and streak analytics.",
+	"author": "Bishwaa",
+	"authorUrl": "",
+	"fundingUrl": "",
+	"isDesktopOnly": false
 }

@@ -7,6 +7,7 @@
   import type HabitTrackerPlugin from "../main";
   import type { Habit } from "../types";
   import HabitAccordionCard from "./HabitAccordionCard.svelte";
+  import MiniView from "./MiniView.svelte";
   import HabitCreateModal from "../HabitCreateModal";
 
   export let plugin: HabitTrackerPlugin;
@@ -24,6 +25,7 @@
   let uiStateLoaded = false;
 
   let compact = false;
+  let miniMode = false;
   let containerEl: HTMLElement;
   let ro: ResizeObserver;
 
@@ -92,7 +94,18 @@
   }
 
   function updateHabit(updated: Habit) {
+    // Replace in local array immediately for this instance
     habits = habits.map(h => h.id === updated.id ? updated : h);
+    // Tell all other instances to reload
+    plugin.onDataChanged();
+  }
+
+  // External reload from another instance — re-read from DataManager
+  // but preserve open state
+  async function reloadFromExternal() {
+    const fresh = await plugin.dataManager.getActiveHabits();
+    // Merge fresh data into existing habits array preserving order
+    habits = fresh;
   }
 
   function removeHabit(id: string) {
@@ -189,10 +202,17 @@
     loadHabits();
     if (containerEl) {
       ro = new ResizeObserver(entries => {
-        compact = entries[0].contentRect.width < 340;
+        const w = entries[0].contentRect.width;
+        miniMode = w < 450;
+        compact  = w < 340 && w >= 450;
       });
       ro.observe(containerEl);
     }
+    // Subscribe to cross-instance updates
+    const unsub = plugin.onDataChangedSubscribe(() => {
+      reloadFromExternal();
+    });
+    return unsub;
   });
 
   onDestroy(() => {
@@ -205,10 +225,9 @@
 
 <div class="ht-app" bind:this={containerEl} class:compact>
 
-  <!-- Header -->
+  <!-- Header — hidden in mini mode, MiniView has its own header -->
+  {#if !miniMode}
   <div class="app-header">
-    <span class="app-title">Habits</span>
-
     {#if !compact}
       <div class="year-nav">
         <button class="year-btn" disabled={!canGoPrev} on:click={prevYear}>&lsaquo;</button>
@@ -231,6 +250,7 @@
       {#if !compact}<span>New habit</span>{/if}
     </button>
   </div>
+  {/if}
 
   <!-- Body -->
   {#if loading}
@@ -264,9 +284,22 @@
     </div>
 
   {:else}
-    <div class="habits-list">
+    <!-- ── Mini 7-day view (width < 450px) ── -->
+    {#if miniMode}
+      <div class="mini-wrap">
+        <MiniView
+          {habits}
+          {plugin}
+          dataManager={plugin.dataManager}
+          on:habitUpdated={(e) => updateHabit(e.detail)}
+        />
+      </div>
 
-      {#each habits as habit, i (habit.id)}
+    <!-- ── Full accordion view ── -->
+    {:else}
+      <div class="habits-list">
+
+        {#each habits as habit, i (habit.id)}
         <div
           class="habit-item"
           class:is-drag-over={dragOverIndex === i && dragSrcIndex !== i}
@@ -284,6 +317,7 @@
             {habit}
             {selectedYear}
             {compact}
+            {plugin}
             isOpen={openHabitIds.has(habit.id)}
             dataManager={plugin.dataManager}
             weekStartsOn={plugin.settings.weekStartsOnMonday ? 1 : 0}
@@ -324,6 +358,7 @@
       {/if}
 
     </div>
+    {/if}
   {/if}
 
 </div>
@@ -353,11 +388,12 @@
   .compact .add-btn { padding:5px 8px; }
 
   /* Habits list */
-  .habits-list { flex:1; overflow-y:auto; padding:8px 10px 12px; display:flex; flex-direction:column; gap:6px; scrollbar-width:thin; scrollbar-color:var(--background-modifier-border) transparent; }
+  .habits-list { flex:1; overflow-y:auto; padding:4px 6px 8px; display:flex; flex-direction:column; gap:4px; scrollbar-width:thin; scrollbar-color:var(--background-modifier-border) transparent; }
   .habits-list::-webkit-scrollbar { width:4px; }
   .habits-list::-webkit-scrollbar-thumb { background:var(--background-modifier-border); border-radius:3px; }
 
-  /* Drag and drop */
+  /* Mini wrap */
+  .mini-wrap { flex:1; overflow-y:auto; }
   .habit-item { transition:opacity 150ms ease, transform 150ms ease; position:relative; }
   .habit-item.is-dragging { opacity:0.4; }
   .habit-item.is-drag-over::before {
