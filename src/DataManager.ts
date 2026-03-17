@@ -175,18 +175,21 @@ export class DataManager {
 		};
 	}
 
-	/** Placeholder for future schema migrations */
+	/** Schema migrations */
 	private migrate(data: HabitData): HabitData {
 		if (!data.version || data.version < DATA_VERSION) {
 			data.version = DATA_VERSION;
 		}
-		// Add uiState if missing (upgrading from older version)
 		if (!data.uiState) {
 			data.uiState = {
 				openHabitIds: [],
 				selectedYear: new Date().getFullYear(),
 				archivedSectionOpen: false,
 			};
+		}
+		// Backfill kind for habits created before counters existed
+		for (const habit of Object.values(data.habits)) {
+			if (!habit.kind) habit.kind = "boolean";
 		}
 		return data;
 	}
@@ -198,6 +201,9 @@ export class DataManager {
 		quote?: string;
 		color?: string;
 		icon?: string;
+		kind?: "boolean" | "counter";
+		target?: number;
+		unit?: string;
 	}): Promise<Habit> {
 		const data = await this.load();
 
@@ -211,6 +217,10 @@ export class DataManager {
 			completions: [],
 			sortOrder: data.habitOrder.length,
 			archived: false,
+			kind: params.kind ?? "boolean",
+			target: params.target,
+			unit: params.unit,
+			counts: params.kind === "counter" ? {} : undefined,
 		};
 
 		data.habits[habit.id] = habit;
@@ -223,13 +233,106 @@ export class DataManager {
 
 	async updateHabit(
 		id: string,
-		updates: Partial<Pick<Habit, "name" | "quote" | "color" | "icon">>,
+		updates: Partial<
+			Pick<
+				Habit,
+				"name" | "quote" | "color" | "icon" | "kind" | "target" | "unit"
+			>
+		>,
 	): Promise<void> {
 		const data = await this.load();
 		if (!data.habits[id]) throw new Error(`Habit ${id} not found`);
 		Object.assign(data.habits[id], updates);
+		// If switching to counter, ensure counts map exists
+		if (updates.kind === "counter" && !data.habits[id].counts) {
+			data.habits[id].counts = {};
+		}
+		// If switching to boolean, clear counts
+		if (updates.kind === "boolean") {
+			data.habits[id].counts = undefined;
+			data.habits[id].target = undefined;
+			data.habits[id].unit = undefined;
+		}
 		await this.persist();
 		await this.writeConfigBackup();
+	}
+
+	// ── Counter methods ──────────────────────────────────────────────────────
+
+	/**
+	 * Increment count for a counter habit on a given date.
+	 * Returns the new count.
+	 */
+	async incrementCount(habitId: string, dateISO: string): Promise<number> {
+		const data = await this.load();
+		const habit = data.habits[habitId];
+		if (!habit || habit.kind !== "counter")
+			throw new Error("Not a counter habit");
+		if (!habit.counts) habit.counts = {};
+
+		habit.counts[dateISO] = (habit.counts[dateISO] ?? 0) + 1;
+		const newCount = habit.counts[dateISO];
+
+		// If reached target, add to completions (for streak math)
+		const target = habit.target ?? 1;
+		if (newCount >= target && !habit.completions.includes(dateISO)) {
+			habit.completions = sortedUnique([...habit.completions, dateISO]);
+		}
+
+		await this.persist();
+
+		if (this.settings.syncToDailyNotes) {
+			this.syncToDailyNote(habit.name, dateISO, newCount >= target).catch(
+				(err) =>
+					console.warn("[HabitTracker] Daily Note sync failed:", err),
+			);
+		}
+
+		return newCount;
+	}
+
+	/**
+	 * Decrement count for a counter habit on a given date.
+	 * Returns the new count (minimum 0).
+	 */
+	async decrementCount(habitId: string, dateISO: string): Promise<number> {
+		const data = await this.load();
+		const habit = data.habits[habitId];
+		if (!habit || habit.kind !== "counter")
+			throw new Error("Not a counter habit");
+		if (!habit.counts) habit.counts = {};
+
+		const current = habit.counts[dateISO] ?? 0;
+		const newCount = Math.max(0, current - 1);
+
+		if (newCount === 0) {
+			delete habit.counts[dateISO];
+		} else {
+			habit.counts[dateISO] = newCount;
+		}
+
+		// If dropped below target, remove from completions
+		const target = habit.target ?? 1;
+		if (newCount < target) {
+			habit.completions = habit.completions.filter((d) => d !== dateISO);
+		}
+
+		await this.persist();
+		return newCount;
+	}
+
+	/** Get count for a counter habit on a specific date */
+	getCount(habit: Habit, dateISO: string): number {
+		return habit.counts?.[dateISO] ?? 0;
+	}
+
+	/** Get progress ratio (0–1) for a counter habit on a date */
+	getProgress(habit: Habit, dateISO: string): number {
+		if (habit.kind !== "counter")
+			return habit.completions.includes(dateISO) ? 1 : 0;
+		const count = habit.counts?.[dateISO] ?? 0;
+		const target = habit.target ?? 1;
+		return Math.min(1, count / target);
 	}
 
 	async archiveHabit(id: string): Promise<void> {
@@ -259,14 +362,13 @@ export class DataManager {
 
 	async getHabit(id: string): Promise<Habit | null> {
 		const data = await this.load();
-		// IMPORTANT: spread to create a new object reference so Svelte detects
-		// the change. Returning the same reference means Svelte sees no diff.
-		return data.habits[id]
-			? {
-					...data.habits[id],
-					completions: [...data.habits[id].completions],
-				}
-			: null;
+		const h = data.habits[id];
+		if (!h) return null;
+		return {
+			...h,
+			completions: [...h.completions],
+			counts: h.counts ? { ...h.counts } : undefined,
+		};
 	}
 
 	/** Returns all non-archived habits in display order */
@@ -275,7 +377,11 @@ export class DataManager {
 		return data.habitOrder
 			.map((id) => data.habits[id])
 			.filter((h) => h && !h.archived)
-			.map((h) => ({ ...h, completions: [...h.completions] }));
+			.map((h) => ({
+				...h,
+				completions: [...h.completions],
+				counts: h.counts ? { ...h.counts } : undefined,
+			}));
 	}
 
 	/** Returns all archived habits */
@@ -284,7 +390,11 @@ export class DataManager {
 		return Object.values(data.habits)
 			.filter((h) => h.archived)
 			.sort((a, b) => a.name.localeCompare(b.name))
-			.map((h) => ({ ...h, completions: [...h.completions] }));
+			.map((h) => ({
+				...h,
+				completions: [...h.completions],
+				counts: h.counts ? { ...h.counts } : undefined,
+			}));
 	}
 
 	async unarchiveHabit(id: string): Promise<void> {

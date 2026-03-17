@@ -28,9 +28,13 @@ export default class HabitEditModal extends Modal {
 	private habitColor: string;
 	private habitQuote: string;
 	private habitIcon: string;
+	private habitKind: "boolean" | "counter";
+	private habitTarget: number;
+	private habitUnit: string;
 
 	private nameInputEl: HTMLInputElement | null = null;
 	private hexInputEl: HTMLInputElement | null = null;
+	private targetRow: HTMLElement | null = null;
 	private colorSwatches: HTMLElement[] = [];
 	private submitBtn: HTMLButtonElement | null = null;
 	private iconPreviewEl: HTMLElement | null = null;
@@ -45,11 +49,13 @@ export default class HabitEditModal extends Modal {
 		this.plugin = plugin;
 		this.habit = habit;
 		this.onSaved = onSaved;
-		// Pre-fill from existing habit
 		this.habitName = habit.name;
 		this.habitColor = habit.color;
 		this.habitQuote = habit.quote ?? "";
 		this.habitIcon = habit.icon ?? "";
+		this.habitKind = habit.kind ?? "boolean";
+		this.habitTarget = habit.target ?? 1;
+		this.habitUnit = habit.unit ?? "";
 	}
 
 	onOpen(): void {
@@ -97,17 +103,17 @@ export default class HabitEditModal extends Modal {
 		// ── Icon ──
 		new Setting(container)
 			.setName("Icon")
-			.setDesc("Any Lucide icon name — e.g. book-open, dumbbell, apple")
+			.setDesc("Emoji or Lucide icon name")
 			.addText((text) => {
 				text.setValue(this.habitIcon)
-					.setPlaceholder("book-open")
+					.setPlaceholder("💧 or droplets")
 					.onChange((v) => {
 						this.habitIcon = v.trim();
 						this.refreshIconPreview();
 					});
 			});
 
-		// Icon preview row
+		// Icon preview
 		const previewRow = container.createDiv({ cls: "icon-preview-row" });
 		previewRow.createEl("span", {
 			text: "Preview:",
@@ -118,6 +124,45 @@ export default class HabitEditModal extends Modal {
 		});
 		this.iconPreviewEl.style.background = this.habitColor;
 		this.refreshIconPreview();
+
+		// ── Type ──
+		new Setting(container).setName("Habit type").addDropdown((drop) => {
+			drop.addOption("boolean", "✓  Simple (done / not done)");
+			drop.addOption("counter", "🔢  Counter (multiple times per day)");
+			drop.setValue(this.habitKind);
+			drop.onChange((v) => {
+				this.habitKind = v as "boolean" | "counter";
+				if (this.targetRow)
+					this.targetRow.style.display =
+						v === "counter" ? "" : "none";
+			});
+		});
+
+		// ── Counter config ──
+		this.targetRow = container.createDiv();
+		this.targetRow.style.display =
+			this.habitKind === "counter" ? "" : "none";
+
+		new Setting(this.targetRow).setName("Daily target").addText((text) =>
+			text
+				.setValue(String(this.habitTarget))
+				.setPlaceholder("5")
+				.onChange((v) => {
+					this.habitTarget = parseInt(v) || 1;
+				}),
+		);
+
+		new Setting(this.targetRow)
+			.setName("Unit")
+			.setDesc("Label per increment — e.g. L, pages, reps")
+			.addText((text) =>
+				text
+					.setValue(this.habitUnit)
+					.setPlaceholder("e.g. L")
+					.onChange((v) => {
+						this.habitUnit = v.trim();
+					}),
+			);
 
 		// ── Color ──
 		const colorSection = container.createDiv({ cls: "color-section" });
@@ -250,6 +295,15 @@ export default class HabitEditModal extends Modal {
 				quote: this.habitQuote.trim(),
 				color: this.habitColor,
 				icon: this.habitIcon || undefined,
+				kind: this.habitKind,
+				target:
+					this.habitKind === "counter"
+						? this.habitTarget || 1
+						: undefined,
+				unit:
+					this.habitKind === "counter"
+						? this.habitUnit || undefined
+						: undefined,
 			});
 			const fresh = await this.plugin.dataManager.getHabit(this.habit.id);
 			new Notice(`✓ "${name}" updated`);

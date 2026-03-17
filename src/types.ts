@@ -8,42 +8,31 @@
  * array — cheap to iterate, easy to serialize, and year-agnostic for streaks.
  */
 export interface Habit {
-	/** Stable UUID generated at creation time — never changes even if name does */
 	id: string;
-
-	/** Display name shown in the accordion header */
 	name: string;
-
-	/** Inline-editable motivational sub-title, e.g. "for a sharper mind" */
 	quote: string;
-
-	/**
-	 * Primary hex color for filled heatmap cells, e.g. "#6366f1".
-	 * Stored here AND mirrored to HabitTracker_Config.md as a plain-text backup.
-	 */
 	color: string;
-
-	/** Optional Lucide icon name, e.g. "book-open", "dumbbell" */
 	icon?: string;
-
-	/**
-	 * ISO date string of the day this habit was first created.
-	 * Used to render the creation-day indicator on the heatmap.
-	 */
 	createdDate: string;
+	completions: string[];
+	sortOrder: number;
+	archived: boolean;
+
+	/** "boolean" = simple done/not-done. "counter" = multiple increments per day. */
+	kind: "boolean" | "counter";
+
+	/** Counter only: how many increments = complete. e.g. 5 for "drink 5L" */
+	target?: number;
+
+	/** Counter only: display unit. e.g. "L", "pages", "reps" */
+	unit?: string;
 
 	/**
-	 * Flat, sorted array of ISO date strings for every completed day.
-	 * Sorted ascending so streak math can walk forward/backward cheaply.
-	 * Example: ["2025-01-03", "2025-01-04", "2026-03-15"]
+	 * Counter only: daily counts. Record<ISO date, count>
+	 * e.g. { "2026-03-16": 3 } means 3 increments on that day.
+	 * Boolean habits never populate this field.
 	 */
-	completions: string[];
-
-	/** Display order in the accordion list — lower index = higher position */
-	sortOrder: number;
-
-	/** Soft-delete flag; keeps history intact while hiding from the UI */
-	archived: boolean;
+	counts?: Record<string, number>;
 }
 
 /**

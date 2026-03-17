@@ -11,8 +11,8 @@
   export let habits: Habit[];
   export let dataManager: DataManager;
   export let plugin: HabitTrackerPlugin;
+  export let instanceId: string = "";
 
-  const dispatch = createEventDispatcher<{ habitUpdated: Habit }>();
 
   // ── Last 7 days ────────────────────────────────────────────────────────
 
@@ -79,35 +79,31 @@
     pending.add(key);
     pending = new Set(pending);
 
-    const set = localMaps[habit.id];
-    if (!set) return;
-    const wasDone = set.has(dateISO);
+    const oldSet = localMaps[habit.id] ?? new Set<string>();
+    const wasDone = oldSet.has(dateISO);
 
-    // Optimistic — mutate and reassign to trigger Svelte
-    if (wasDone) set.delete(dateISO);
-    else set.add(dateISO);
-    localMaps = { ...localMaps };
-    // Keep sig in sync so external resync doesn't overwrite us
+    // Create a NEW Set so Svelte detects the reference change
+    const newSet = new Set(oldSet);
+    if (wasDone) newSet.delete(dateISO);
+    else         newSet.add(dateISO);
+
+    // Assign new Set AND new outer object — both references change
+    localMaps = { ...localMaps, [habit.id]: newSet };
     trackedSig = buildSig(habits.map(h =>
-      h.id === habit.id
-        ? { ...h, completions: [...set] }
-        : h
+      h.id === habit.id ? { ...h, completions: [...newSet] } : h
     ));
 
     try {
       await dataManager.toggleCompletion(habit.id, dateISO);
-      const fresh = await dataManager.getHabit(habit.id);
-      if (fresh) {
-        localMaps[habit.id] = new Set(fresh.completions);
-        localMaps = { ...localMaps };
-        trackedSig = buildSig(habits.map(h => h.id === fresh.id ? fresh : h));
-        dispatch("habitUpdated", fresh);
-        plugin.onDataChanged();
-      }
+      dispatch("habitUpdated", { ...habit,
+        completions: wasDone
+          ? habit.completions.filter(d => d !== dateISO)
+          : [...habit.completions, dateISO]
+      });
+      plugin.onDataChanged(instanceId);
     } catch (_e) {
-      if (wasDone) set.add(dateISO);
-      else set.delete(dateISO);
-      localMaps = { ...localMaps };
+      // Roll back — restore old set
+      localMaps = { ...localMaps, [habit.id]: oldSet };
     } finally {
       pending.delete(key);
       pending = new Set(pending);
@@ -118,7 +114,7 @@
     new HabitCreateModal(plugin.app, plugin, (newHabit) => {
       habits = [...habits, newHabit];
       completionMaps[newHabit.id] = new Set(newHabit.completions);
-      plugin.onDataChanged();
+      plugin.onDataChanged(instanceId);
     }).open();
   }
 
@@ -161,12 +157,7 @@
       <span class="mini-title">Habits</span>
       <span class="mini-brand">by HabitGrid</span>
     </div>
-    <button class="mini-add-btn" on:click={openCreateModal} title="Add new habit" aria-label="Add new habit">
-      <svg width="11" height="11" viewBox="0 0 11 11" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round">
-        <line x1="5.5" y1="1" x2="5.5" y2="10"/>
-        <line x1="1" y1="5.5" x2="10" y2="5.5"/>
-      </svg>
-    </button>
+    <button class="mini-add-btn" on:click={openCreateModal} title="Add new habit" aria-label="Add new habit">+</button>
   </div>
 
   <!-- Day header row — no add button here -->
@@ -197,20 +188,49 @@
 
       <!-- 7 day cells -->
       {#each days as day}
-        {@const done = set.has(day.dateISO)}
+        {@const isCounter = habit.kind === "counter"}
+        {@const count = isCounter ? (localMaps[habit.id]?.size ? (habit.counts?.[day.dateISO] ?? 0) : 0) : 0}
+        {@const habitTarget = habit.target ?? 1}
+        {@const done = set ? set.has(day.dateISO) : false}
+        {@const ratio = isCounter ? Math.min(1, count / habitTarget) : (done ? 1 : 0)}
         {@const key = `${habit.id}:${day.dateISO}`}
         <div class="cell-col">
-          <button
-            class="mini-cell"
-            class:mini-cell-done={done}
-            class:mini-cell-today={day.isToday}
-            class:mini-cell-pending={pending.has(key)}
-            style="background:{done ? habit.color : rgba(habit.color, 0.12)};"
-            on:click={() => toggle(habit, day.dateISO)}
-            title="{day.dateISO}{done ? ' ✓' : ''}"
-            aria-pressed={done}
-            aria-label="{habit.name} {day.dateISO}"
-          ></button>
+          {#if isCounter}
+            <!-- Counter: shows progress as opacity + count number -->
+            <button
+              class="mini-cell mini-cell-counter"
+              class:mini-cell-done={ratio >= 1}
+              class:mini-cell-today={day.isToday}
+              class:mini-cell-pending={pending.has(key)}
+              style="background:{ratio > 0 ? rgba(habit.color, 0.15 + ratio * 0.85) : rgba(habit.color, 0.10)}; border-color:{rgba(habit.color, 0.3)};"
+              on:click={() => toggle(habit, day.dateISO)}
+              title="{day.dateISO} · {count}/{habitTarget}{habit.unit ? ' '+habit.unit : ''}"
+              aria-label="{habit.name} {day.dateISO}"
+            >
+              {#if count > 0}
+                <span class="mini-count" style="color:{ratio >= 1 ? 'white' : habit.color};">{count}</span>
+              {/if}
+            </button>
+          {:else}
+            <!-- Boolean: simple checkbox -->
+            <button
+              class="mini-cell"
+              class:mini-cell-done={done}
+              class:mini-cell-today={day.isToday}
+              class:mini-cell-pending={pending.has(key)}
+              style="background:{done ? habit.color : rgba(habit.color, 0.12)};"
+              on:click={() => toggle(habit, day.dateISO)}
+              title="{day.dateISO}{done ? ' ✓' : ''}"
+              aria-pressed={done}
+              aria-label="{habit.name} {day.dateISO}"
+            >
+              {#if done}
+                <svg width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="white" stroke-width="1.8" stroke-linecap="round">
+                  <polyline points="1.5 5 4 7.5 8.5 2.5"/>
+                </svg>
+              {/if}
+            </button>
+          {/if}
         </div>
       {/each}
 
@@ -298,7 +318,11 @@
     justify-content: center;
     cursor: pointer;
     flex-shrink: 0;
+    font-size: 18px;
+    font-weight: 300;
+    line-height: 1;
     transition: opacity 120ms ease;
+    padding: 0 0 1px 0;
   }
 
   .mini-add-btn:hover { opacity: .88; }
@@ -317,7 +341,7 @@
   }
 
   .day-col {
-    width: 26px;
+    width: 30px;
     flex-shrink: 0;
     display: flex;
     flex-direction: column;
@@ -381,21 +405,21 @@
   }
 
   .mini-icon {
-    width: 22px;
-    height: 22px;
-    border-radius: 6px;
+    width: 36px;
+    height: 36px;
+    border-radius: 10px;
     flex-shrink: 0;
     display: flex;
     align-items: center;
     justify-content: center;
-    font-size: 11px;
+    font-size: 20px;
     font-weight: 600;
     overflow: hidden;
   }
 
   .mini-icon :global(svg) {
-    width: 12px;
-    height: 12px;
+    width: 19px;
+    height: 19px;
     stroke: currentColor;
     fill: none;
   }
@@ -411,7 +435,7 @@
 
   /* ── Day cells ── */
   .cell-col {
-    width: 26px;
+    width: 30px;
     flex-shrink: 0;
     display: flex;
     align-items: center;
@@ -420,12 +444,25 @@
 
   .mini-cell {
     all: unset;
-    width: 20px;
-    height: 20px;
-    border-radius: 5px;
+    width: 24px;
+    height: 24px;
+    border-radius: 6px;
     cursor: pointer;
     transition: transform 80ms ease, opacity 100ms ease;
     flex-shrink: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+
+  .mini-cell.mini-cell-counter {
+    border: 1px solid;
+  }
+
+  .mini-count {
+    font-size: 10px;
+    font-weight: 700;
+    line-height: 1;
   }
 
   .mini-cell:hover { transform: scale(1.1); }

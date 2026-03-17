@@ -93,18 +93,17 @@
     openHabitIds = next;
   }
 
+  // Unique ID for this instance so we can ignore our own onDataChanged broadcasts
+  const instanceId = Math.random().toString(36).slice(2);
+
   function updateHabit(updated: Habit) {
-    // Replace in local array immediately for this instance
     habits = habits.map(h => h.id === updated.id ? updated : h);
-    // Tell all other instances to reload
-    plugin.onDataChanged();
+    // Notify OTHER instances only — not ourselves
+    plugin.onDataChanged(instanceId);
   }
 
-  // External reload from another instance — re-read from DataManager
-  // but preserve open state
   async function reloadFromExternal() {
     const fresh = await plugin.dataManager.getActiveHabits();
-    // Merge fresh data into existing habits array preserving order
     habits = fresh;
   }
 
@@ -208,9 +207,9 @@
       });
       ro.observe(containerEl);
     }
-    // Subscribe to cross-instance updates
-    const unsub = plugin.onDataChangedSubscribe(() => {
-      reloadFromExternal();
+    // Only reload when change came from a DIFFERENT instance
+    const unsub = plugin.onDataChangedSubscribe((sourceId) => {
+      if (sourceId !== instanceId) reloadFromExternal();
     });
     return unsub;
   });
@@ -290,6 +289,7 @@
         <MiniView
           {habits}
           {plugin}
+          {instanceId}
           dataManager={plugin.dataManager}
           on:habitUpdated={(e) => updateHabit(e.detail)}
         />

@@ -1,4 +1,4 @@
-<!-- HeatmapGrid.svelte -->
+<!-- HeatmapGrid.svelte — pure renderer, state passed in as props -->
 
 <script lang="ts">
   import { createEventDispatcher } from "svelte";
@@ -11,107 +11,76 @@
   export let weekStartsOn: 0 | 1 = 1;
   export let compact: boolean = false;
 
-  const dispatch = createEventDispatcher<{ toggle: { dateISO: string; completed: boolean } }>();
+  // ── State passed in from parent (HabitAccordionCard owns these) ────────────
+  export let doneSet:  Set<string>           = new Set();
+  export let countMap: Record<string, number> = {};
 
-  // ── Local completions ─────────────────────────────────────────────────────
+  const dispatch = createEventDispatcher<{
+    toggle:    { dateISO: string; completed: boolean };
+    localTick: { dateISO: string; newDoneSet: Set<string>; newCountMap: Record<string,number> };
+  }>();
 
-  let localCompletions: string[] = [...habit.completions];
-  let trackedId = habit.id;
-  let trackedYear = year;
-  let trackedLen = habit.completions.length;
-
-  $: {
-    const idChanged  = habit.id !== trackedId;
-    const yrChanged  = year !== trackedYear;
-    // Resync when parent passes a new completions array (external update)
-    const lenChanged = habit.completions.length !== trackedLen;
-
-    if (idChanged || yrChanged || lenChanged) {
-      localCompletions = [...habit.completions];
-      trackedId  = habit.id;
-      trackedYear = year;
-      trackedLen = habit.completions.length;
-    }
-  }
-
-  $: completionSet = new Set<string>(
-    localCompletions.filter(d => d.startsWith(`${year}-`))
-  );
+  $: isCounter = habit.kind === "counter";
+  $: target    = habit.target ?? 1;
 
   // ── Helpers ───────────────────────────────────────────────────────────────
 
   function rgba(hex: string, a: number): string {
-    const c = hex.replace("#", "");
-    const f = c.length === 3 ? c.split("").map(x => x+x).join("") : c;
-    const r = parseInt(f.slice(0,2),16), g = parseInt(f.slice(2,4),16), b = parseInt(f.slice(4,6),16);
-    if (isNaN(r)||isNaN(g)||isNaN(b)) return `rgba(99,99,99,${a})`;
+    const c = hex.replace("#","");
+    const f = c.length===3 ? c.split("").map(x=>x+x).join("") : c;
+    const r=parseInt(f.slice(0,2),16), g=parseInt(f.slice(2,4),16), b=parseInt(f.slice(4,6),16);
+    if(isNaN(r)||isNaN(g)||isNaN(b)) return `rgba(99,99,99,${a})`;
     return `rgba(${r},${g},${b},${a})`;
   }
 
-  const today = new Date().toISOString().slice(0, 10);
-
-  function isFuture(d: string) { return d > today; }
-  function isToday(d: string)  { return d === today; }
+  const today = new Date().toISOString().slice(0,10);
+  function isFuture(d: string)   { return d > today; }
+  function isToday(d: string)    { return d === today; }
   function isCreation(d: string) { return habit.createdDate === d; }
 
-  // ── Grid — always full year ────────────────────────────────────────────────
+  // ── Grid builder ──────────────────────────────────────────────────────────
 
-  $: grid = buildGrid(year, weekStartsOn);
-
-  // Month label positions: array of { label, weekIndex } so labels sit
-  // exactly above the first week-column that belongs to each month.
+  $: grid           = buildGrid(year, weekStartsOn);
   $: monthPositions = buildMonthPositions(grid);
 
-  function buildGrid(yr: number, dow: 0|1) {
-    const weeks: Array<Array<{dateISO:string}|null>> = [];
-    const j1 = new Date(yr, 0, 1);
-    const d0 = j1.getDay();
-    const back = dow===1 ? (d0===0?6:d0-1) : d0;
-    const start = new Date(j1); start.setDate(j1.getDate()-back);
+  const CELL=16, GAP=3;
+  const MONTHS=["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];
 
-    // Always go to Dec 31 + fill to end of that week
-    const d31 = new Date(yr, 11, 31);
-    const de = d31.getDay();
-    const fwd = dow===1 ? (de===0?0:7-de) : 6-de;
-    const end = new Date(d31); end.setDate(d31.getDate()+fwd);
-
-    let cur = new Date(start), week: Array<{dateISO:string}|null> = [];
-    while (cur <= end) {
-      week.push(cur.getFullYear()===yr ? {dateISO:toISO(cur)} : null);
+  function buildGrid(yr:number, dow:0|1) {
+    const weeks:Array<Array<{dateISO:string}|null>>=[];
+    const j1=new Date(yr,0,1), d0=j1.getDay();
+    const back=dow===1?(d0===0?6:d0-1):d0;
+    const start=new Date(j1); start.setDate(j1.getDate()-back);
+    const d31=new Date(yr,11,31), de=d31.getDay();
+    const fwd=dow===1?(de===0?0:7-de):6-de;
+    const end=new Date(d31); end.setDate(d31.getDate()+fwd);
+    let cur=new Date(start), week:Array<{dateISO:string}|null>=[];
+    while(cur<=end){
+      week.push(cur.getFullYear()===yr?{dateISO:toISO(cur)}:null);
       cur.setDate(cur.getDate()+1);
-      if (week.length===7) { weeks.push(week); week=[]; }
+      if(week.length===7){weeks.push(week);week=[];}
     }
-    if (week.length) weeks.push(week);
+    if(week.length) weeks.push(week);
     return weeks;
   }
 
-  function toISO(d: Date) {
+  function toISO(d:Date){
     return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,"0")}-${String(d.getDate()).padStart(2,"0")}`;
   }
 
-  const MONTHS = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];
-
-  /**
-   * For each week-column index, check if the first real cell in that column
-   * starts a new month. If so, record the label and the week index.
-   * This ensures month labels are placed exactly above the right column.
-   */
-  function buildMonthPositions(g: typeof grid): Array<{label: string; weekIndex: number}> {
-    const result: Array<{label: string; weekIndex: number}> = [];
-    let lastMonth = -1;
-    g.forEach((week, wi) => {
-      const first = week.find(c => c !== null);
-      if (!first) return;
-      const m = parseInt(first.dateISO.slice(5,7)) - 1;
-      if (m !== lastMonth) {
-        lastMonth = m;
-        result.push({ label: MONTHS[m], weekIndex: wi });
-      }
+  function buildMonthPositions(g:typeof grid){
+    let last=-1;
+    const result:Array<{label:string;weekIndex:number}>=[];
+    g.forEach((week,wi)=>{
+      const f=week.find(c=>c!==null);
+      if(!f) return;
+      const m=parseInt(f.dateISO.slice(5,7))-1;
+      if(m!==last){last=m;result.push({label:MONTHS[m],weekIndex:wi});}
     });
     return result;
   }
 
-  // ── Click handler ─────────────────────────────────────────────────────────
+  // ── Click handler — notifies parent immediately via localTick ─────────────
 
   let pending = new Set<string>();
 
@@ -119,82 +88,109 @@
     if (isFuture(dateISO) || pending.has(dateISO)) return;
     pending.add(dateISO);
     pending = new Set(pending);
-    const wasDone = localCompletions.includes(dateISO);
-    if (wasDone) {
-      localCompletions = localCompletions.filter(d => d !== dateISO);
+
+    if (isCounter) {
+      const current  = countMap[dateISO] ?? 0;
+      const newCount = current >= target ? 0 : current + 1;
+      const newCountMap = { ...countMap };
+      if (newCount === 0) delete newCountMap[dateISO];
+      else newCountMap[dateISO] = newCount;
+
+      const newDoneSet = new Set(doneSet);
+      if (newCount >= target) newDoneSet.add(dateISO);
+      else newDoneSet.delete(dateISO);
+
+      // Tell parent to update its state immediately (before await)
+      dispatch("localTick", { dateISO, newDoneSet, newCountMap });
+
+      try {
+        if (newCount === 0) {
+          let c = current;
+          while (c > 0) { await dataManager.decrementCount(habit.id, dateISO); c--; }
+        } else {
+          await dataManager.incrementCount(habit.id, dateISO);
+        }
+        dispatch("toggle", { dateISO, completed: newCount >= target });
+      } catch (e) {
+        // Roll back — tell parent to restore
+        dispatch("localTick", { dateISO, newDoneSet: doneSet, newCountMap: countMap });
+        console.error("[HeatmapGrid]", e);
+      }
+
     } else {
-      localCompletions = [...localCompletions, dateISO];
+      const wasDone   = doneSet.has(dateISO);
+      const newDoneSet = new Set(doneSet);
+      if (wasDone) newDoneSet.delete(dateISO);
+      else         newDoneSet.add(dateISO);
+
+      // Tell parent immediately
+      dispatch("localTick", { dateISO, newDoneSet, newCountMap: countMap });
+
+      try {
+        const nowDone = await dataManager.toggleCompletion(habit.id, dateISO);
+        dispatch("toggle", { dateISO, completed: nowDone });
+      } catch (e) {
+        dispatch("localTick", { dateISO, newDoneSet: doneSet, newCountMap: countMap });
+        console.error("[HeatmapGrid]", e);
+      }
     }
-    // Keep trackedLen in sync so the $: block doesn't fight our local update
-    trackedLen = localCompletions.length;
-    try {
-      const nowDone = await dataManager.toggleCompletion(habit.id, dateISO);
-      dispatch("toggle", { dateISO, completed: nowDone });
-    } catch (e) {
-      localCompletions = wasDone
-        ? [...localCompletions, dateISO]
-        : localCompletions.filter(d => d !== dateISO);
-      trackedLen = localCompletions.length;
-      console.error("[HeatmapGrid]", e);
-    } finally {
-      pending.delete(dateISO);
-      pending = new Set(pending);
-    }
+
+    pending.delete(dateISO);
+    pending = new Set(pending);
   }
 
   function keydown(e: KeyboardEvent, d: string) {
     if (e.key==="Enter"||e.key===" ") { e.preventDefault(); click(d); }
   }
-
-  // Cell size + gap — must match CSS exactly so month label offsets are correct
-  const CELL = 16;  // px
-  const GAP  = 3;   // px — gap between week columns
 </script>
 
 <!-- ── Markup ─────────────────────────────────────────────────────────────── -->
 
 <div class="hm" class:compact>
 
-  <!-- Month labels: absolutely positioned above each month's first column -->
   {#if !compact}
   <div class="month-row" aria-hidden="true">
     {#each monthPositions as mp}
-      <span
-        class="mlbl"
-        style="left:{mp.weekIndex * (CELL + GAP)}px;"
-      >{mp.label}</span>
+      <span class="mlbl" style="left:{mp.weekIndex*(CELL+GAP)}px;">{mp.label}</span>
     {/each}
   </div>
   {/if}
 
-  <!-- Week columns -->
   <div class="weeks">
     {#each grid as week}
       <div class="week">
         {#each week as cell}
-          {#if cell === null}
+          {#if cell===null}
             <div class="cell spacer"></div>
           {:else}
+            {@const count  = isCounter ? (countMap[cell.dateISO] ?? 0) : 0}
+            {@const done   = isCounter ? count >= target : doneSet.has(cell.dateISO)}
+            {@const ratio  = isCounter ? Math.min(1, count / target) : 0}
+            {@const future = isFuture(cell.dateISO)}
+            {@const bg = isCounter
+              ? count === 0
+                ? rgba(habit.color, future ? 0.04 : 0.10)
+                : rgba(habit.color, 0.15 + ratio * 0.85)
+              : doneSet.has(cell.dateISO)
+                ? habit.color
+                : rgba(habit.color, future ? 0.04 : 0.10)
+            }
             <!-- svelte-ignore a11y-interactive-supports-focus -->
             <div
               class="cell"
-              class:done={completionSet.has(cell.dateISO)}
+              class:done
               class:tod={isToday(cell.dateISO)}
-              class:fut={isFuture(cell.dateISO)}
+              class:fut={future}
               class:pend={pending.has(cell.dateISO)}
               role="gridcell"
-              tabindex={isFuture(cell.dateISO) ? -1 : 0}
-              title="{cell.dateISO}{completionSet.has(cell.dateISO) ? ' ✓' : ''}{isToday(cell.dateISO) ? ' · today' : ''}{isCreation(cell.dateISO) ? ' · habit started here' : ''}"
-              aria-pressed={completionSet.has(cell.dateISO)}
-              style="background-color:{
-                completionSet.has(cell.dateISO)
-                  ? habit.color
-                  : rgba(habit.color, isFuture(cell.dateISO) ? 0.04 : 0.12)
-              };"
-              on:click={() => click(cell.dateISO)}
-              on:keydown={(e) => keydown(e, cell.dateISO)}
+              tabindex={future ? -1 : 0}
+              title="{cell.dateISO}{isCounter && count > 0 ? ' · '+count+'/'+target+(habit.unit?' '+habit.unit:'') : doneSet.has(cell.dateISO) ? ' ✓' : ''}{isToday(cell.dateISO) ? ' · today' : ''}{isCreation(cell.dateISO) ? ' · habit started here' : ''}"
+              aria-pressed={done}
+              style="background-color:{bg};"
+              on:click={()=>click(cell.dateISO)}
+              on:keydown={(e)=>keydown(e,cell.dateISO)}
             >
-              {#if isCreation(cell.dateISO) && !completionSet.has(cell.dateISO)}
+              {#if isCreation(cell.dateISO) && !done}
                 <span class="dot" aria-hidden="true"></span>
               {/if}
             </div>
@@ -204,12 +200,11 @@
     {/each}
   </div>
 
-  <!-- Legend -->
   {#if !compact}
   <div class="legend" aria-hidden="true">
     <span class="ll">Less</span>
-    {#each [0.08, 0.25, 0.5, 0.8, 1] as a}
-      <div class="lc" style="background:{rgba(habit.color, a)};"></div>
+    {#each [0.08,0.25,0.5,0.8,1] as a}
+      <div class="lc" style="background:{rgba(habit.color,a)};"></div>
     {/each}
     <span class="ll">More</span>
   </div>
@@ -217,84 +212,36 @@
 
 </div>
 
-<!-- ── Styles ──────────────────────────────────────────────────────────────── -->
-
 <style>
-  .hm {
-    display: flex;
-    flex-direction: column;
-    gap: 3px;
-    width: 100%;
-    /* Clip silently — no scrollbar ever shown */
-    overflow: hidden;
-  }
+  .hm { display:flex; flex-direction:column; gap:3px; width:100%; overflow:hidden; }
 
-  /* Month label row — fixed height, relative so labels can use left: */
-  .month-row {
-    position: relative;
-    height: 14px;
-    flex-shrink: 0;
-  }
+  .month-row { position:relative; height:14px; flex-shrink:0; }
+  .mlbl { position:absolute; top:0; font-size:10px; color:var(--text-muted); white-space:nowrap; line-height:14px; pointer-events:none; }
 
-  .mlbl {
-    position: absolute;
-    top: 0;
-    font-size: 10px;
-    color: var(--text-muted);
-    white-space: nowrap;
-    line-height: 14px;
-    pointer-events: none;
-  }
+  .weeks { display:flex; gap:3px; flex-shrink:0; }
+  .week  { display:flex; flex-direction:column; gap:3px; }
 
-  /* Week columns */
-  .weeks { display: flex; gap: 3px; flex-shrink: 0; }
-  .week  { display: flex; flex-direction: column; gap: 3px; }
-
-  /* Cells — size must match CELL/GAP constants in script */
   .cell {
-    width: 16px;
-    height: 16px;
-    border-radius: 3px;
-    cursor: pointer;
-    position: relative;
-    outline: none;
-    flex-shrink: 0;
-    transition: transform 80ms ease;
+    width:16px; height:16px; border-radius:3px;
+    cursor:pointer; position:relative; outline:none; flex-shrink:0;
+    transition:transform 80ms ease;
   }
+  .cell.spacer { background:transparent!important; pointer-events:none; }
+  .cell.fut    { pointer-events:none; cursor:default; }
+  .cell.pend   { opacity:0.5; cursor:wait; }
 
-  .cell.spacer { background: transparent !important; pointer-events: none; }
-  .cell.fut    { pointer-events: none; cursor: default; }
-  .cell.pend   { opacity: 0.5; cursor: wait; }
+  .cell:not(.spacer):not(.fut):hover         { transform:scale(1.4); z-index:2; }
+  .cell:not(.spacer):not(.fut):focus-visible { box-shadow:0 0 0 2px var(--interactive-accent); z-index:2; }
+  .cell.tod      { box-shadow:0 0 0 1.5px var(--text-normal); }
+  .cell.done.tod { box-shadow:0 0 0 1.5px var(--text-normal); }
 
-  .cell:not(.spacer):not(.fut):hover        { transform: scale(1.4); z-index: 2; }
-  .cell:not(.spacer):not(.fut):focus-visible { box-shadow: 0 0 0 2px var(--interactive-accent); z-index: 2; }
+  .dot { position:absolute; bottom:2px; right:2px; width:3px; height:3px; border-radius:50%; background:currentColor; opacity:.5; pointer-events:none; }
 
-  .cell.tod      { box-shadow: 0 0 0 1.5px var(--text-normal); }
-  .cell.done.tod { box-shadow: 0 0 0 1.5px var(--text-normal); }
+  .compact .cell  { width:9px; height:9px; border-radius:2px; }
+  .compact .weeks { gap:2px; }
+  .compact .week  { gap:2px; }
 
-  .dot {
-    position: absolute;
-    bottom: 2px; right: 2px;
-    width: 3px; height: 3px;
-    border-radius: 50%;
-    background: currentColor;
-    opacity: .5;
-    pointer-events: none;
-  }
-
-  /* Compact */
-  .compact .cell  { width: 9px; height: 9px; border-radius: 2px; }
-  .compact .weeks { gap: 2px; }
-  .compact .week  { gap: 2px; }
-
-  /* Legend */
-  .legend {
-    display: flex;
-    align-items: center;
-    gap: 3px;
-    justify-content: flex-end;
-    padding-top: 3px;
-  }
-  .ll { font-size: 9px; color: var(--text-muted); }
-  .lc { width: 10px; height: 10px; border-radius: 2px; }
+  .legend { display:flex; align-items:center; gap:3px; justify-content:flex-end; padding-top:3px; }
+  .ll { font-size:9px; color:var(--text-muted); }
+  .lc { width:10px; height:10px; border-radius:2px; }
 </style>

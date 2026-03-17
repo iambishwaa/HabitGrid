@@ -60,13 +60,13 @@ export default class HabitTrackerPlugin extends Plugin {
 	// Any HabitTrackerApp that writes data calls onDataChanged().
 	// All other open instances subscribe and reload their habits array.
 
-	private _listeners: Array<() => void> = [];
+	private _listeners: Array<(sourceId: string) => void> = [];
 
-	onDataChanged(): void {
-		this._listeners.forEach((fn) => fn());
+	onDataChanged(sourceId = ""): void {
+		this._listeners.forEach((fn) => fn(sourceId));
 	}
 
-	onDataChangedSubscribe(fn: () => void): () => void {
+	onDataChangedSubscribe(fn: (sourceId: string) => void): () => void {
 		this._listeners.push(fn);
 		return () => {
 			this._listeners = this._listeners.filter((f) => f !== fn);
