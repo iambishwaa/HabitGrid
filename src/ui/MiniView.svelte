@@ -1,5 +1,4 @@
-<!-- MiniView.svelte — compact 7-day view for screens < 450px -->
-
+<!-- MiniView.svelte -->
 <script lang="ts">
   import { createEventDispatcher } from "svelte";
   import type { Habit } from "../types";
@@ -13,24 +12,20 @@
   export let plugin: HabitTrackerPlugin;
   export let instanceId: string = "";
 
+  const dispatch = createEventDispatcher<{ habitUpdated: Habit }>();
 
-  // ── Last 7 days ────────────────────────────────────────────────────────
+  // ── Last 7 days ───────────────────────────────────────────────────────────
 
   const DAY_SHORT = ["Su","Mo","Tu","We","Th","Fr","Sa"];
-  const MONTHS_SHORT = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];
 
-  function getLast7(): { dateISO: string; dayLabel: string; dateNum: number; isToday: boolean }[] {
+  $: days = getLast7();
+
+  function getLast7() {
     const result = [];
     for (let i = 6; i >= 0; i--) {
-      const d = new Date();
-      d.setDate(d.getDate() - i);
+      const d = new Date(); d.setDate(d.getDate() - i);
       const iso = toISO(d);
-      result.push({
-        dateISO: iso,
-        dayLabel: DAY_SHORT[d.getDay()],
-        dateNum: d.getDate(),
-        isToday: i === 0,
-      });
+      result.push({ dateISO: iso, dayLabel: DAY_SHORT[d.getDay()], dateNum: d.getDate(), isToday: i === 0 });
     }
     return result;
   }
@@ -39,128 +34,162 @@
     return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,"0")}-${String(d.getDate()).padStart(2,"0")}`;
   }
 
-  $: days = getLast7();
+  // ── Per-habit local state ─────────────────────────────────────────────────
+  // localSets: habitId → Set<dateISO> of completions
+  // localCounts: habitId → Record<dateISO, count>
+  // Always replaced with new objects — never mutated in place.
 
-  // ── Per-habit local completions ────────────────────────────────────────
-  // Local state — not reactive to habit prop changes mid-toggle.
-  // Resyncs when habits array length changes (new habit added/removed)
-  // or when a specific habit's completion count changes (external update).
+  let localSets:   Record<string, Set<string>>            = buildSets(habits);
+  let localCounts: Record<string, Record<string, number>> = buildCounts(habits);
+  let syncSig = buildSig(habits);
 
-  let localMaps: Record<string, Set<string>> = buildMaps(habits);
-  let trackedSig = buildSig(habits);
-
-  function buildMaps(hs: Habit[]): Record<string, Set<string>> {
+  function buildSets(hs: Habit[]): Record<string, Set<string>> {
     return Object.fromEntries(hs.map(h => [h.id, new Set(h.completions)]));
   }
 
-  // Signature: "id:len,id:len,..." — cheap way to detect external changes
-  function buildSig(hs: Habit[]): string {
-    return hs.map(h => `${h.id}:${h.completions.length}`).join(",");
+  function buildCounts(hs: Habit[]): Record<string, Record<string, number>> {
+    return Object.fromEntries(hs.map(h => [h.id, h.counts ? { ...h.counts } : {}]));
   }
 
+  function buildSig(hs: Habit[]): string {
+    return hs.map(h => `${h.id}:${h.completions.join(",")}:${JSON.stringify(h.counts ?? {})}`).join("|");
+  }
+
+  // Resync when habits array changes externally (main view, other window)
   $: {
-    const sig = buildSig(habits);
-    if (sig !== trackedSig) {
-      localMaps = buildMaps(habits);
-      trackedSig = sig;
+    const incoming = buildSig(habits);
+    if (incoming !== syncSig) {
+      localSets   = buildSets(habits);
+      localCounts = buildCounts(habits);
+      syncSig     = incoming;
     }
   }
 
-  // Alias for template
-  $: completionMaps = localMaps;
+  // ── Toggle ────────────────────────────────────────────────────────────────
 
-  // ── Toggle ─────────────────────────────────────────────────────────────
-
-  let pending = new Set<string>(); // "habitId:dateISO"
+  let pending = new Set<string>();
 
   async function toggle(habit: Habit, dateISO: string) {
     const key = `${habit.id}:${dateISO}`;
     if (pending.has(key)) return;
-    pending.add(key);
-    pending = new Set(pending);
+    pending.add(key); pending = new Set(pending);
 
-    const oldSet = localMaps[habit.id] ?? new Set<string>();
-    const wasDone = oldSet.has(dateISO);
+    const isCounter = habit.kind === "counter";
+    const target    = habit.target ?? 1;
 
-    // Create a NEW Set so Svelte detects the reference change
-    const newSet = new Set(oldSet);
-    if (wasDone) newSet.delete(dateISO);
-    else         newSet.add(dateISO);
+    let newHabit: Habit;
 
-    // Assign new Set AND new outer object — both references change
-    localMaps = { ...localMaps, [habit.id]: newSet };
-    trackedSig = buildSig(habits.map(h =>
-      h.id === habit.id ? { ...h, completions: [...newSet] } : h
-    ));
+    if (isCounter) {
+      const oldCounts = localCounts[habit.id] ?? {};
+      const current   = oldCounts[dateISO] ?? 0;
+      const newCount  = current >= target ? 0 : current + 1;
+      const newCountsForHabit = { ...oldCounts };
+      if (newCount <= 0) delete newCountsForHabit[dateISO];
+      else newCountsForHabit[dateISO] = newCount;
 
-    try {
-      await dataManager.toggleCompletion(habit.id, dateISO);
-      dispatch("habitUpdated", { ...habit,
-        completions: wasDone
-          ? habit.completions.filter(d => d !== dateISO)
-          : [...habit.completions, dateISO]
-      });
-      plugin.onDataChanged(instanceId);
-    } catch (_e) {
-      // Roll back — restore old set
-      localMaps = { ...localMaps, [habit.id]: oldSet };
-    } finally {
-      pending.delete(key);
-      pending = new Set(pending);
+      // New Set — never mutate
+      const newSet = new Set(localSets[habit.id] ?? new Set<string>());
+      if (newCount >= target) newSet.add(dateISO);
+      else                    newSet.delete(dateISO);
+
+      const newCompletions = newCount >= target
+        ? [...new Set([...habit.completions, dateISO])].sort()
+        : habit.completions.filter(d => d !== dateISO);
+
+      localSets   = { ...localSets,   [habit.id]: newSet };
+      localCounts = { ...localCounts, [habit.id]: newCountsForHabit };
+      syncSig = buildSig(habits.map(h => h.id === habit.id ? { ...h, completions: newCompletions, counts: newCountsForHabit } : h));
+
+      newHabit = { ...habit, completions: newCompletions, counts: newCountsForHabit };
+
+      // Notify immediately — before disk write
+      dispatch("habitUpdated", newHabit);
+      plugin.onDataChanged(instanceId, newHabit);
+
+      try {
+        await dataManager.setCount(habit.id, dateISO, newCount);
+      } catch (_e) {
+        localSets   = { ...localSets,   [habit.id]: new Set(localSets[habit.id]) };
+        localCounts = { ...localCounts, [habit.id]: { ...oldCounts } };
+      }
+
+    } else {
+      const oldSet  = localSets[habit.id] ?? new Set<string>();
+      const wasDone = oldSet.has(dateISO);
+
+      const newSet = new Set(oldSet);
+      if (wasDone) newSet.delete(dateISO);
+      else         newSet.add(dateISO);
+
+      const newCompletions = wasDone
+        ? habit.completions.filter(d => d !== dateISO)
+        : [...habit.completions, dateISO].sort();
+
+      localSets = { ...localSets, [habit.id]: newSet };
+      syncSig   = buildSig(habits.map(h => h.id === habit.id ? { ...h, completions: newCompletions } : h));
+
+      newHabit = { ...habit, completions: newCompletions };
+
+      // Notify immediately — before disk write
+      dispatch("habitUpdated", newHabit);
+      plugin.onDataChanged(instanceId, newHabit);
+
+      try {
+        await dataManager.toggleCompletion(habit.id, dateISO);
+      } catch (_e) {
+        localSets = { ...localSets, [habit.id]: new Set(oldSet) };
+      }
     }
+
+    pending.delete(key); pending = new Set(pending);
   }
+
+  // ── Create modal ──────────────────────────────────────────────────────────
 
   function openCreateModal() {
     new HabitCreateModal(plugin.app, plugin, (newHabit) => {
       habits = [...habits, newHabit];
-      completionMaps[newHabit.id] = new Set(newHabit.completions);
-      plugin.onDataChanged(instanceId);
+      localSets   = { ...localSets,   [newHabit.id]: new Set(newHabit.completions) };
+      localCounts = { ...localCounts, [newHabit.id]: newHabit.counts ? { ...newHabit.counts } : {} };
+      syncSig = buildSig(habits);
+      plugin.onDataChanged(instanceId); // full reload — new habit not in other instance yet
     }).open();
   }
 
-  // ── Icon rendering ─────────────────────────────────────────────────────
-
-  function renderIcon(el: HTMLElement, icon: string | undefined, name: string) {
-    if (!el) return;
-    el.empty();
-    if (icon) {
-      const isEmoji = /\p{Emoji}/u.test(icon);
-      if (isEmoji) {
-        el.textContent = icon;
-      } else {
-        try { setIcon(el, icon); }
-        catch (_e) { el.textContent = name.slice(0,1).toUpperCase(); }
-      }
-    } else {
-      el.textContent = name.slice(0,1).toUpperCase();
-    }
-  }
-
-  // ── Hex → rgba ─────────────────────────────────────────────────────────
+  // ── Icon rendering ────────────────────────────────────────────────────────
 
   function rgba(hex: string, a: number): string {
-    const c = hex.replace("#","");
-    const f = c.length===3 ? c.split("").map(x=>x+x).join("") : c;
-    const r = parseInt(f.slice(0,2),16), g = parseInt(f.slice(2,4),16), b = parseInt(f.slice(4,6),16);
-    if (isNaN(r)||isNaN(g)||isNaN(b)) return `rgba(99,99,99,${a})`;
-    return `rgba(${r},${g},${b},${a})`;
+    const c=hex.replace("#",""); const f=c.length===3?c.split("").map(x=>x+x).join(""):c;
+    const r=parseInt(f.slice(0,2),16),g=parseInt(f.slice(2,4),16),b=parseInt(f.slice(4,6),16);
+    if(isNaN(r)||isNaN(g)||isNaN(b)) return `rgba(99,99,99,${a})`; return `rgba(${r},${g},${b},${a})`;
+  }
+
+  function renderIconAction(node: HTMLElement, params: { icon?: string; name: string }) {
+    function render({ icon, name }: { icon?: string; name: string }) {
+      node.textContent = "";
+      if (icon) {
+        const isEmoji = /\p{Emoji}/u.test(icon);
+        if (isEmoji) { node.textContent = icon; }
+        else { try { setIcon(node, icon); } catch { node.textContent = name.slice(0,1).toUpperCase(); } }
+      } else { node.textContent = name.slice(0,1).toUpperCase(); }
+    }
+    render(params);
+    return { update(p: { icon?: string; name: string }) { render(p); } };
   }
 </script>
 
-<!-- ── Markup ──────────────────────────────────────────────────────────────── -->
-
 <div class="mini-view">
 
-  <!-- Header: "Habits by HabitGrid" + add button on right -->
+  <!-- Header -->
   <div class="mini-header">
     <div class="mini-titles">
       <span class="mini-title">Habits</span>
       <span class="mini-brand">by HabitGrid</span>
     </div>
-    <button class="mini-add-btn" on:click={openCreateModal} title="Add new habit" aria-label="Add new habit">+</button>
+    <button class="mini-add-btn" on:click={openCreateModal} title="Add new habit">+</button>
   </div>
 
-  <!-- Day header row — no add button here -->
+  <!-- Day column headers -->
   <div class="day-header">
     <div class="name-col"></div>
     {#each days as day}
@@ -173,307 +202,89 @@
 
   <!-- Habit rows -->
   {#each habits as habit (habit.id)}
-    {@const set = completionMaps[habit.id]}
+    {@const isCounter = habit.kind === "counter"}
+    {@const target    = habit.target ?? 1}
+    {@const habitSet  = localSets[habit.id]   ?? new Set()}
+    {@const habitCnts = localCounts[habit.id] ?? {}}
     <div class="habit-row" style="--hc:{habit.color};">
 
-      <!-- Name + icon -->
       <div class="habit-name-col">
-        <div
-          class="mini-icon"
-          style="background:{rgba(habit.color, 0.2)}; color:{habit.color};"
-          use:renderIconAction={{ icon: habit.icon, name: habit.name }}
-        ></div>
+        <div class="mini-icon"
+          style="background:{rgba(habit.color,.2)};color:{habit.color};"
+          use:renderIconAction={{ icon: habit.icon, name: habit.name }}></div>
         <span class="habit-label">{habit.name}</span>
       </div>
 
-      <!-- 7 day cells -->
       {#each days as day}
-        {@const isCounter = habit.kind === "counter"}
-        {@const count = isCounter ? (localMaps[habit.id]?.size ? (habit.counts?.[day.dateISO] ?? 0) : 0) : 0}
-        {@const habitTarget = habit.target ?? 1}
-        {@const done = set ? set.has(day.dateISO) : false}
-        {@const ratio = isCounter ? Math.min(1, count / habitTarget) : (done ? 1 : 0)}
-        {@const key = `${habit.id}:${day.dateISO}`}
+        {@const key    = `${habit.id}:${day.dateISO}`}
+        {@const count  = isCounter ? (habitCnts[day.dateISO] ?? 0) : 0}
+        {@const done   = isCounter ? count >= target : habitSet.has(day.dateISO)}
+        {@const ratio  = isCounter ? Math.min(1, count/target) : (done ? 1 : 0)}
         <div class="cell-col">
-          {#if isCounter}
-            <!-- Counter: shows progress as opacity + count number -->
-            <button
-              class="mini-cell mini-cell-counter"
-              class:mini-cell-done={ratio >= 1}
-              class:mini-cell-today={day.isToday}
-              class:mini-cell-pending={pending.has(key)}
-              style="background:{ratio > 0 ? rgba(habit.color, 0.15 + ratio * 0.85) : rgba(habit.color, 0.10)}; border-color:{rgba(habit.color, 0.3)};"
-              on:click={() => toggle(habit, day.dateISO)}
-              title="{day.dateISO} · {count}/{habitTarget}{habit.unit ? ' '+habit.unit : ''}"
-              aria-label="{habit.name} {day.dateISO}"
-            >
-              {#if count > 0}
-                <span class="mini-count" style="color:{ratio >= 1 ? 'white' : habit.color};">{count}</span>
-              {/if}
-            </button>
-          {:else}
-            <!-- Boolean: simple checkbox -->
-            <button
-              class="mini-cell"
-              class:mini-cell-done={done}
-              class:mini-cell-today={day.isToday}
-              class:mini-cell-pending={pending.has(key)}
-              style="background:{done ? habit.color : rgba(habit.color, 0.12)};"
-              on:click={() => toggle(habit, day.dateISO)}
-              title="{day.dateISO}{done ? ' ✓' : ''}"
-              aria-pressed={done}
-              aria-label="{habit.name} {day.dateISO}"
-            >
-              {#if done}
-                <svg width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="white" stroke-width="1.8" stroke-linecap="round">
-                  <polyline points="1.5 5 4 7.5 8.5 2.5"/>
-                </svg>
-              {/if}
-            </button>
-          {/if}
+          <button
+            class="mini-cell"
+            class:mini-cell-done={done}
+            class:mini-cell-today={day.isToday}
+            class:mini-cell-pending={pending.has(key)}
+            style="background:{
+              isCounter
+                ? done ? habit.color : count === 0 ? rgba(habit.color,.10) : rgba(habit.color, 0.15+ratio*0.85)
+                : done ? habit.color : rgba(habit.color,.12)
+            }; {isCounter && !done ? 'border:1px solid '+rgba(habit.color,.3)+';' : ''}"
+            on:click={() => toggle(habit, day.dateISO)}
+            title="{day.dateISO}{isCounter&&count>0?' · '+count+'/'+target+(habit.unit?' '+habit.unit:''):done?' ✓':''}"
+            aria-pressed={done}
+          >
+            {#if done}
+              <svg width="12" height="12" viewBox="0 0 12 12" fill="none" stroke="white" stroke-width="2" stroke-linecap="round">
+                <polyline points="2 6 5 9 10 3"/>
+              </svg>
+            {:else if isCounter && count > 0}
+              <span class="mini-count" style="color:{habit.color};">{count}</span>
+            {/if}
+          </button>
         </div>
       {/each}
-
     </div>
   {/each}
 
 </div>
 
-<!-- ── Svelte action for icon rendering ──────────────────────────────────── -->
 <script context="module" lang="ts">
-  export function renderIconAction(node: HTMLElement, params: { icon?: string; name: string }) {
-    function render({ icon, name }: { icon?: string; name: string }) {
-      node.textContent = "";
-      if (icon) {
-        const isEmoji = /\p{Emoji}/u.test(icon);
-        if (isEmoji) {
-          node.textContent = icon;
-        } else {
-          try {
-            const { setIcon } = require("obsidian");
-            setIcon(node, icon);
-          } catch (_e) {
-            node.textContent = name.slice(0,1).toUpperCase();
-          }
-        }
-      } else {
-        node.textContent = name.slice(0,1).toUpperCase();
-      }
-    }
-    render(params);
-    return {
-      update(p: { icon?: string; name: string }) { render(p); },
-    };
-  }
+  export { };
 </script>
 
-<!-- ── Styles ──────────────────────────────────────────────────────────────── -->
-
 <style>
-  .mini-view {
-    display: flex;
-    flex-direction: column;
-    width: 100%;
-    padding: 4px 0;
-  }
+  .mini-view{display:flex;flex-direction:column;width:100%;padding:4px 0;}
 
-  /* ── Mini header ── */
-  .mini-header {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    padding: 6px 6px 4px;
-    border-bottom: 1px solid var(--background-modifier-border);
-    margin-bottom: 2px;
-  }
+  .mini-header{display:flex;align-items:center;justify-content:space-between;padding:6px 6px 4px;border-bottom:1px solid var(--background-modifier-border);margin-bottom:2px;}
+  .mini-titles{display:flex;align-items:baseline;gap:5px;}
+  .mini-title{font-size:.78rem;font-weight:600;color:var(--text-normal);letter-spacing:.03em;}
+  .mini-brand{font-size:.68rem;color:var(--text-faint);font-style:italic;}
+  .mini-add-btn{background:var(--interactive-accent);color:var(--text-on-accent);border:none;border-radius:5px;width:22px;height:22px;display:flex;align-items:center;justify-content:center;cursor:pointer;font-size:18px;font-weight:300;line-height:1;padding:0 0 1px;transition:opacity 120ms;}
+  .mini-add-btn:hover{opacity:.88;}
 
-  .mini-titles {
-    display: flex;
-    align-items: baseline;
-    gap: 5px;
-  }
+  .day-header{display:flex;align-items:flex-end;padding:0 6px 4px;gap:0;}
+  .name-col{flex:1;min-width:0;}
+  .day-col{width:30px;flex-shrink:0;display:flex;flex-direction:column;align-items:center;gap:1px;}
+  .day-label{font-size:10px;color:var(--text-muted);font-weight:400;line-height:1;}
+  .day-num{font-size:12px;color:var(--text-muted);font-weight:400;line-height:1;}
+  .day-today .day-label,.day-today .day-num{color:var(--text-normal);font-weight:600;}
 
-  .mini-title {
-    font-size: .78rem;
-    font-weight: 600;
-    color: var(--text-normal);
-    letter-spacing: .03em;
-  }
+  .habit-row{display:flex;align-items:center;gap:0;padding:4px 6px;border-radius:6px;transition:background 120ms;}
+  .habit-row:hover{background:color-mix(in srgb,var(--hc) 5%,transparent);}
+  .habit-row+.habit-row{border-top:1px solid var(--background-modifier-border);}
 
-  .mini-brand {
-    font-size: .68rem;
-    color: var(--text-faint);
-    font-style: italic;
-  }
+  .habit-name-col{flex:1;min-width:0;display:flex;align-items:center;gap:7px;overflow:hidden;}
+  .mini-icon{width:36px;height:36px;border-radius:10px;flex-shrink:0;display:flex;align-items:center;justify-content:center;font-size:20px;font-weight:600;overflow:hidden;}
+  .mini-icon :global(svg){width:19px;height:19px;stroke:currentColor;fill:none;}
+  .habit-label{font-size:.84rem;font-weight:500;color:var(--text-normal);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
 
-  .mini-add-btn {
-    background: var(--interactive-accent);
-    color: var(--text-on-accent);
-    border: none;
-    border-radius: 5px;
-    width: 22px;
-    height: 22px;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    cursor: pointer;
-    flex-shrink: 0;
-    font-size: 18px;
-    font-weight: 300;
-    line-height: 1;
-    transition: opacity 120ms ease;
-    padding: 0 0 1px 0;
-  }
-
-  .mini-add-btn:hover { opacity: .88; }
-
-  /* ── Day header ── */
-  .day-header {
-    display: flex;
-    align-items: flex-end;
-    padding: 0 6px 6px;
-    gap: 3px;
-  }
-
-  .name-col {
-    flex: 1;
-    min-width: 0;
-  }
-
-  .day-col {
-    width: 30px;
-    flex-shrink: 0;
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-    gap: 1px;
-  }
-
-  .day-label {
-    font-size: 10px;
-    color: var(--text-muted);
-    font-weight: 400;
-    line-height: 1;
-  }
-
-  .day-num {
-    font-size: 12px;
-    color: var(--text-muted);
-    font-weight: 400;
-    line-height: 1;
-  }
-
-  .day-today .day-label,
-  .day-today .day-num {
-    color: var(--text-normal);
-    font-weight: 600;
-  }
-
-  /* ── Habit rows ── */
-  .habit-row {
-    display: flex;
-    align-items: center;
-    gap: 3px;
-    padding: 4px 6px;
-    border-radius: 8px;
-    transition: background 120ms ease;
-  }
-
-  .habit-row:hover {
-    background: color-mix(in srgb, var(--hc) 5%, transparent);
-  }
-
-  /* Separator line between rows */
-  .habit-row + .habit-row {
-    border-top: 1px solid var(--background-modifier-border);
-    border-radius: 0;
-    padding-top: 4px;
-  }
-
-  .habit-row:last-child {
-    border-radius: 0 0 8px 8px;
-  }
-
-  /* ── Name column ── */
-  .habit-name-col {
-    flex: 1;
-    min-width: 0;
-    display: flex;
-    align-items: center;
-    gap: 7px;
-    overflow: hidden;
-  }
-
-  .mini-icon {
-    width: 36px;
-    height: 36px;
-    border-radius: 10px;
-    flex-shrink: 0;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    font-size: 20px;
-    font-weight: 600;
-    overflow: hidden;
-  }
-
-  .mini-icon :global(svg) {
-    width: 19px;
-    height: 19px;
-    stroke: currentColor;
-    fill: none;
-  }
-
-  .habit-label {
-    font-size: .84rem;
-    font-weight: 500;
-    color: var(--text-normal);
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-  }
-
-  /* ── Day cells ── */
-  .cell-col {
-    width: 30px;
-    flex-shrink: 0;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-  }
-
-  .mini-cell {
-    all: unset;
-    width: 24px;
-    height: 24px;
-    border-radius: 6px;
-    cursor: pointer;
-    transition: transform 80ms ease, opacity 100ms ease;
-    flex-shrink: 0;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-  }
-
-  .mini-cell.mini-cell-counter {
-    border: 1px solid;
-  }
-
-  .mini-count {
-    font-size: 10px;
-    font-weight: 700;
-    line-height: 1;
-  }
-
-  .mini-cell:hover { transform: scale(1.1); }
-  .mini-cell:active { transform: scale(.92); }
-  .mini-cell.mini-cell-pending { opacity: .5; pointer-events: none; }
-
-  .mini-cell.mini-cell-today {
-    box-shadow: 0 0 0 2px var(--text-normal);
-  }
-
-  .mini-cell.mini-cell-done.mini-cell-today {
-    box-shadow: 0 0 0 2px var(--text-normal);
-  }
+  .cell-col{width:30px;flex-shrink:0;display:flex;align-items:center;justify-content:center;}
+  .mini-cell{all:unset;width:24px;height:24px;border-radius:6px;cursor:pointer;transition:transform 80ms,opacity 100ms;flex-shrink:0;display:flex;align-items:center;justify-content:center;box-sizing:border-box;}
+  .mini-cell:hover{transform:scale(1.1);}
+  .mini-cell:active{transform:scale(.92);}
+  .mini-cell.mini-cell-pending{opacity:.5;pointer-events:none;}
+  .mini-cell.mini-cell-today{box-shadow:0 0 0 2px var(--text-normal);}
+  .mini-count{font-size:10px;font-weight:700;line-height:1;}
 </style>

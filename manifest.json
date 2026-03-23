@@ -4,8 +4,8 @@
 	"version": "0.1.0",
 	"minAppVersion": "1.4.0",
 	"description": "GitHub-style heatmap habit tracking directly in your vault — with Daily Note sync and streak analytics.",
-	"author": "Bishwaa",
+	"author": "bishwaa",
 	"authorUrl": "",
-	"fundingUrl": "",
+	"fundingUrl": "https://buymemomo.com/iambishwaa",
 	"isDesktopOnly": false
 }

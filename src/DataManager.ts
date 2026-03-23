@@ -122,7 +122,7 @@ export class DataManager {
 	/**
 	 * Load data.json from the plugin's internal storage directory.
 	 * Obsidian exposes this through `this.app.vault.adapter` at the path
-	 * `.obsidian/plugins/habit-tracker/data.json`. We read it ourselves so we
+	 * `.obsidian/plugins/habitgrid-by-bishwaa/data.json`. We read it ourselves so we
 	 * can cache it and perform partial updates without round-tripping.
 	 *
 	 * NOTE: In the actual plugin class (main.ts) we call `this.loadData()` which
@@ -154,11 +154,97 @@ export class DataManager {
 	}
 
 	private getDataPath(): string {
-		// Obsidian stores plugin data at .obsidian/plugins/<id>/data.json
-		// We use a dedicated file alongside it for clarity.
 		return normalizePath(
-			`${this.app.vault.configDir}/plugins/habit-tracker/data.json`,
+			`${this.app.vault.configDir}/plugins/habitgrid-by-bishwaa/data.json`,
 		);
+	}
+
+	private getMetaPath(): string {
+		return normalizePath(
+			`${this.app.vault.configDir}/plugins/habitgrid-by-bishwaa/meta.json`,
+		);
+	}
+
+	/**
+	 * Writes habit metadata (color, icon, quote, kind, target, unit, sortOrder)
+	 * to meta.json alongside data.json. This file survives data.json deletion
+	 * and is used by rebuildFromDailyNotes to restore full habit appearance.
+	 * Counter counts are NOT stored here — they come from data.json only.
+	 */
+	private async writeMetaBackup(): Promise<void> {
+		const data = await this.load();
+		const meta: Record<
+			string,
+			{
+				name: string;
+				color: string;
+				icon?: string;
+				quote: string;
+				kind: "boolean" | "counter";
+				target?: number;
+				unit?: string;
+				createdDate: string;
+				sortOrder: number;
+				archived: boolean;
+				frontmatterKey: string;
+			}
+		> = {};
+
+		for (const [id, habit] of Object.entries(data.habits)) {
+			meta[id] = {
+				name: habit.name,
+				color: habit.color,
+				icon: habit.icon,
+				quote: habit.quote,
+				kind: habit.kind ?? "boolean",
+				target: habit.target,
+				unit: habit.unit,
+				createdDate: habit.createdDate,
+				sortOrder: habit.sortOrder,
+				archived: habit.archived,
+				frontmatterKey: this.habitNameToFrontmatterKey(habit.name),
+			};
+		}
+
+		await this.app.vault.adapter.write(
+			this.getMetaPath(),
+			JSON.stringify(
+				{
+					version: 1,
+					habits: meta,
+					deletedHabitKeys: data.deletedHabitKeys,
+				},
+				null,
+				2,
+			),
+		);
+	}
+
+	private async readMetaBackup(): Promise<
+		Record<
+			string,
+			{
+				name: string;
+				color: string;
+				icon?: string;
+				quote: string;
+				kind: "boolean" | "counter";
+				target?: number;
+				unit?: string;
+				createdDate: string;
+				sortOrder: number;
+				archived: boolean;
+				frontmatterKey: string;
+			}
+		>
+	> {
+		try {
+			const raw = await this.app.vault.adapter.read(this.getMetaPath());
+			const parsed = JSON.parse(raw);
+			return parsed.habits ?? {};
+		} catch {
+			return {};
+		}
 	}
 
 	private emptyData(): HabitData {
@@ -172,22 +258,22 @@ export class DataManager {
 				archivedSectionOpen: false,
 			},
 			lastModified: new Date().toISOString(),
+			deletedHabitKeys: [],
+			resetLog: [],
 		};
 	}
 
-	/** Schema migrations */
 	private migrate(data: HabitData): HabitData {
-		if (!data.version || data.version < DATA_VERSION) {
+		if (!data.version || data.version < DATA_VERSION)
 			data.version = DATA_VERSION;
-		}
-		if (!data.uiState) {
+		if (!data.uiState)
 			data.uiState = {
 				openHabitIds: [],
 				selectedYear: new Date().getFullYear(),
 				archivedSectionOpen: false,
 			};
-		}
-		// Backfill kind for habits created before counters existed
+		if (!data.deletedHabitKeys) data.deletedHabitKeys = [];
+		if (!data.resetLog) data.resetLog = [];
 		for (const habit of Object.values(data.habits)) {
 			if (!habit.kind) habit.kind = "boolean";
 		}
@@ -225,9 +311,8 @@ export class DataManager {
 
 		data.habits[habit.id] = habit;
 		data.habitOrder.push(habit.id);
-
 		await this.persist();
-		await this.writeConfigBackup();
+		this.writeMetaBackup().catch(() => {}); // fire-and-forget
 		return habit;
 	}
 
@@ -254,7 +339,7 @@ export class DataManager {
 			data.habits[id].unit = undefined;
 		}
 		await this.persist();
-		await this.writeConfigBackup();
+		this.writeMetaBackup().catch(() => {});
 	}
 
 	// ── Counter methods ──────────────────────────────────────────────────────
@@ -281,10 +366,10 @@ export class DataManager {
 
 		await this.persist();
 
-		if (this.settings.syncToDailyNotes) {
+		// Always sync to HabitGrid folder
+		{
 			this.syncToDailyNote(habit.name, dateISO, newCount >= target).catch(
-				(err) =>
-					console.warn("[HabitTracker] Daily Note sync failed:", err),
+				(err) => console.warn("[HabitGrid] Sync failed:", err),
 			);
 		}
 
@@ -335,6 +420,53 @@ export class DataManager {
 		return Math.min(1, count / target);
 	}
 
+	/**
+	 * Atomically set the count for a counter habit on a given date.
+	 * Much cleaner than looping increment/decrement.
+	 */
+	async setCount(
+		habitId: string,
+		dateISO: string,
+		count: number,
+	): Promise<void> {
+		const data = await this.load();
+		const habit = data.habits[habitId];
+		if (!habit || habit.kind !== "counter")
+			throw new Error("Not a counter habit");
+		if (!habit.counts) habit.counts = {};
+
+		if (count <= 0) {
+			delete habit.counts[dateISO];
+			habit.completions = habit.completions.filter((d) => d !== dateISO);
+		} else {
+			habit.counts[dateISO] = count;
+			const target = habit.target ?? 1;
+			if (count >= target && !habit.completions.includes(dateISO)) {
+				habit.completions = sortedUnique([
+					...habit.completions,
+					dateISO,
+				]);
+			} else if (count < target) {
+				habit.completions = habit.completions.filter(
+					(d) => d !== dateISO,
+				);
+			}
+		}
+
+		await this.persist();
+
+		// Always sync to HabitGrid folder with the count value
+		{
+			const target = habit.target ?? 1;
+			this.syncToDailyNote(
+				habit.name,
+				dateISO,
+				count >= target,
+				count > 0 ? count : undefined,
+			).catch((err) => console.warn("[HabitGrid] Sync failed:", err));
+		}
+	}
+
 	async archiveHabit(id: string): Promise<void> {
 		const data = await this.load();
 		if (!data.habits[id]) return;
@@ -344,11 +476,17 @@ export class DataManager {
 
 	async deleteHabit(id: string): Promise<void> {
 		const data = await this.load();
-		if (!data.habits[id]) return;
+		const habit = data.habits[id];
+		if (!habit) return;
+		// Add frontmatter key to tombstone so rebuild never recreates this habit
+		const key = this.habitNameToFrontmatterKey(habit.name);
+		if (!data.deletedHabitKeys.includes(key)) {
+			data.deletedHabitKeys.push(key);
+		}
 		delete data.habits[id];
 		data.habitOrder = data.habitOrder.filter((hid) => hid !== id);
 		await this.persist();
-		await this.writeConfigBackup();
+		this.writeMetaBackup().catch(() => {});
 	}
 
 	async reorderHabits(orderedIds: string[]): Promise<void> {
@@ -459,13 +597,10 @@ export class DataManager {
 
 		await this.persist();
 
-		// Fire-and-forget the Daily Note sync — never block the UI on file I/O
-		if (this.settings.syncToDailyNotes) {
-			this.syncToDailyNote(habit.name, dateISO, isNowComplete).catch(
-				(err) =>
-					console.warn("[HabitTracker] Daily Note sync failed:", err),
-			);
-		}
+		// Always write to HabitGrid folder (fire-and-forget)
+		this.syncToDailyNote(habit.name, dateISO, isNowComplete).catch((err) =>
+			console.warn("[HabitGrid] Sync failed:", err),
+		);
 
 		return isNowComplete;
 	}
@@ -474,74 +609,151 @@ export class DataManager {
 		return habit.completions.includes(dateISO);
 	}
 
-	// ── Daily Note sync ──────────────────────────────────────────────────────
+	// ── HabitGrid folder ─────────────────────────────────────────────────────
+
+	/** Full path to the HabitGrid folder, e.g. "Notes/HabitGrid" or "HabitGrid" */
+	getHabitGridFolderPath(): string {
+		const parent = this.settings.habitGridParentFolder?.trim();
+		return normalizePath(parent ? `${parent}/HabitGrid` : "HabitGrid");
+	}
+
+	/** Creates the HabitGrid folder if it doesn't exist yet */
+	async ensureHabitGridFolder(): Promise<void> {
+		const path = this.getHabitGridFolderPath();
+		const existing = this.app.vault.getAbstractFileByPath(path);
+		if (!existing) {
+			await this.app.vault.createFolder(path);
+		}
+	}
+
+	/** Path to a specific date file inside the HabitGrid folder */
+	private getHabitGridNotePath(dateISO: string): string {
+		return normalizePath(`${this.getHabitGridFolderPath()}/${dateISO}.md`);
+	}
 
 	/**
-	 * Appends or updates a `habit_<slug>: true/false` key in the YAML
-	 * frontmatter of the Daily Note for the given date.
-	 *
-	 * Creates the note with minimal frontmatter if it doesn't exist yet,
-	 * so the recovery engine has something to scan later.
+	 * Moves all HabitGrid date files from old folder to new folder.
+	 * Called when user changes habitGridParentFolder in settings.
+	 */
+	async moveHabitGridFolder(
+		oldParent: string,
+		newParent: string,
+	): Promise<void> {
+		const oldFolder = normalizePath(
+			oldParent ? `${oldParent}/HabitGrid` : "HabitGrid",
+		);
+		const newFolder = normalizePath(
+			newParent ? `${newParent}/HabitGrid` : "HabitGrid",
+		);
+		if (oldFolder === newFolder) return;
+
+		const oldDir = this.app.vault.getAbstractFileByPath(oldFolder);
+		if (!oldDir) return; // nothing to move
+
+		// Ensure new folder exists
+		await this.app.vault.createFolder(newFolder).catch(() => {});
+
+		// Move each .md file
+		const { Vault } = await import("obsidian");
+		const files = this.app.vault
+			.getMarkdownFiles()
+			.filter((f) => f.path.startsWith(oldFolder + "/"));
+		for (const file of files) {
+			const newPath = normalizePath(newFolder + "/" + file.name);
+			await this.app.fileManager.renameFile(file, newPath);
+		}
+
+		// Remove old folder if empty
+		try {
+			await this.app.vault.delete(oldDir as any);
+		} catch {
+			/* ignore if not empty */
+		}
+	}
+
+	// ── Daily Note / HabitGrid sync ───────────────────────────────────────────
+
+	/**
+	 * Writes habit completion data to the HabitGrid folder date file.
+	 * File format:
+	 *   - YAML frontmatter with tags: [habitgrid], date, and habit keys
+	 *   - A warning callout so users know not to edit manually
 	 */
 	async syncToDailyNote(
 		habitName: string,
 		dateISO: string,
 		completed: boolean,
+		count?: number,
 	): Promise<void> {
-		if (!this.settings.syncToDailyNotes) return;
-
-		const notePath = this.getDailyNotePath(dateISO);
+		await this.ensureHabitGridFolder();
+		const notePath = this.getHabitGridNotePath(dateISO);
 		const key = this.habitNameToFrontmatterKey(habitName);
-		const valueStr = completed ? "true" : "false";
+		const valueStr =
+			count !== undefined ? String(count) : completed ? "true" : "false";
 
-		let file = this.app.vault.getAbstractFileByPath(
+		const existing = this.app.vault.getAbstractFileByPath(
 			notePath,
 		) as TFile | null;
 
-		if (!file) {
-			if (!completed) return; // Don't create a note just to write false
-			await this.app.vault.create(
-				notePath,
-				`---\ndate: ${dateISO}\n${key}: true\n---\n`,
-			);
+		if (!existing) {
+			if (!completed && !count) return; // Don't create file just to write false/0
+			const content = this.buildHabitGridNote(dateISO, {
+				[key]: valueStr,
+			});
+			await this.app.vault.create(notePath, content);
 			return;
 		}
 
-		const content = await this.app.vault.read(file);
-
+		// Update existing file's frontmatter key
+		const content = await this.app.vault.read(existing);
 		if (content.startsWith("---")) {
-			// Update existing frontmatter
 			const endIdx = content.indexOf("---", 3);
 			if (endIdx === -1) return;
-
 			const frontmatter = content.slice(3, endIdx);
 			const keyRegex = new RegExp(`^${key}:.*$`, "m");
-
-			let newFrontmatter: string;
-			if (keyRegex.test(frontmatter)) {
-				newFrontmatter = frontmatter.replace(
-					keyRegex,
-					`${key}: ${valueStr}`,
-				);
-			} else {
-				newFrontmatter =
-					frontmatter.trimEnd() + `\n${key}: ${valueStr}\n`;
-			}
-
-			const newContent =
-				"---" + newFrontmatter + "---" + content.slice(endIdx + 3);
-			await this.app.vault.modify(file, newContent);
+			const newFrontmatter = keyRegex.test(frontmatter)
+				? frontmatter.replace(keyRegex, `${key}: ${valueStr}`)
+				: frontmatter.trimEnd() + `\n${key}: ${valueStr}\n`;
+			await this.app.vault.modify(
+				existing,
+				"---" + newFrontmatter + "---" + content.slice(endIdx + 3),
+			);
 		} else {
-			// Prepend frontmatter to a note that doesn't have any
-			const newContent = `---\ndate: ${dateISO}\n${key}: ${valueStr}\n---\n\n${content}`;
-			await this.app.vault.modify(file, newContent);
+			// Prepend frontmatter
+			await this.app.vault.modify(
+				existing,
+				this.buildHabitGridNote(dateISO, { [key]: valueStr }) +
+					"\n\n" +
+					content,
+			);
 		}
 	}
 
+	private buildHabitGridNote(
+		dateISO: string,
+		habits: Record<string, string>,
+	): string {
+		const habitLines = Object.entries(habits)
+			.map(([k, v]) => `${k}: ${v}`)
+			.join("\n");
+		return [
+			"---",
+			`date: ${dateISO}`,
+			"tags: [habitgrid]",
+			habitLines,
+			"---",
+			"",
+			"> [!warning] Do not edit this file manually",
+			"> This file is managed by **HabitGrid**. Manual edits may be lost or cause data conflicts. Use the HabitGrid plugin to track your habits.",
+			"",
+		].join("\n");
+	}
+
 	private getDailyNotePath(dateISO: string): string {
-		const fmt = this.settings.dailyNoteDateFormat;
+		// Kept for rebuild scanning of user's own Daily Notes folder
+		const fmt = "YYYY-MM-DD";
 		const filename = moment(dateISO, "YYYY-MM-DD").format(fmt);
-		const folder = this.settings.dailyNotesFolder;
+		const folder = "";
 		return normalizePath(
 			folder ? `${folder}/${filename}.md` : `${filename}.md`,
 		);
@@ -578,6 +790,31 @@ export class DataManager {
 	}> {
 		const data = await this.load();
 
+		// Load meta backup — restores color, icon, quote, kind, target, unit
+		const metaBackup = await this.readMetaBackup();
+
+		// Build lookup: frontmatterKey → meta entry
+		const keyToMeta: Record<string, (typeof metaBackup)[string]> = {};
+		for (const entry of Object.values(metaBackup)) {
+			if (entry.frontmatterKey) keyToMeta[entry.frontmatterKey] = entry;
+		}
+
+		// Also merge any metadata from backup into existing habits in data
+		for (const [id, meta] of Object.entries(metaBackup)) {
+			if (data.habits[id]) {
+				// Restore appearance fields if they look default (i.e. lost)
+				const h = data.habits[id];
+				if (!h.color || h.color === "#6366f1") h.color = meta.color;
+				if (!h.icon && meta.icon) h.icon = meta.icon;
+				if (!h.quote && meta.quote) h.quote = meta.quote;
+				if (!h.kind) h.kind = meta.kind;
+				if (meta.kind === "counter") {
+					h.target = meta.target;
+					h.unit = meta.unit;
+				}
+			}
+		}
+
 		// Build a reverse map: frontmatter key → habit id
 		const keyToId: Record<string, string> = {};
 		for (const [id, habit] of Object.entries(data.habits)) {
@@ -586,10 +823,15 @@ export class DataManager {
 			}
 		}
 
-		const folder = this.settings.dailyNotesFolder;
-		const files = this.app.vault
-			.getMarkdownFiles()
-			.filter((f) => (folder ? f.path.startsWith(folder + "/") : true));
+		const folder = "";
+		const habitGridFolder = this.getHabitGridFolderPath();
+
+		// Scan both the user's Daily Notes folder AND the HabitGrid folder
+		const files = this.app.vault.getMarkdownFiles().filter((f) => {
+			if (f.path.startsWith(habitGridFolder + "/")) return true;
+			if (folder) return f.path.startsWith(folder + "/");
+			return true;
+		});
 
 		let completionsRestored = 0;
 		const discoveredKeys = new Set<string>();
@@ -598,35 +840,48 @@ export class DataManager {
 			const cache = this.app.metadataCache.getFileCache(file);
 			if (!cache?.frontmatter) continue;
 
-			// Try to extract the date from the filename
-			const basename = file.basename;
-			const dateISO = this.parseDateFromFilename(basename);
+			const dateISO = this.parseDateFromFilename(file.basename);
 			if (!dateISO) continue;
+
+			if (data.resetAt && dateISO < data.resetAt) continue;
 
 			for (const [key, value] of Object.entries(cache.frontmatter)) {
 				if (!key.startsWith("habit_")) continue;
+				if (data.deletedHabitKeys.includes(key)) continue;
+
 				discoveredKeys.add(key);
 
-				if (value !== true && value !== "true") continue;
+				if (
+					value !== true &&
+					value !== "true" &&
+					typeof value !== "number"
+				)
+					continue;
 
 				let habitId = keyToId[key];
 
-				// Auto-create a skeleton habit if we've never seen this key before
 				if (!habitId) {
-					const guessedName = key
-						.replace(/^habit_/, "")
-						.replace(/_/g, " ")
-						.replace(/\b\w/g, (c) => c.toUpperCase());
-
+					// Try to restore from meta backup first
+					const meta = keyToMeta[key];
 					const newHabit: Habit = {
 						id: crypto.randomUUID(),
-						name: guessedName,
-						quote: "",
-						color: "#6366f1",
-						createdDate: dateISO,
+						name:
+							meta?.name ??
+							key
+								.replace(/^habit_/, "")
+								.replace(/_/g, " ")
+								.replace(/\b\w/g, (c) => c.toUpperCase()),
+						quote: meta?.quote ?? "",
+						color: meta?.color ?? "#6366f1",
+						icon: meta?.icon,
+						createdDate: meta?.createdDate ?? dateISO,
 						completions: [],
-						sortOrder: data.habitOrder.length,
+						sortOrder: meta?.sortOrder ?? data.habitOrder.length,
 						archived: false,
+						kind: meta?.kind ?? "boolean",
+						target: meta?.target,
+						unit: meta?.unit,
+						counts: meta?.kind === "counter" ? {} : undefined,
 					};
 
 					data.habits[newHabit.id] = newHabit;
@@ -636,20 +891,42 @@ export class DataManager {
 				}
 
 				const habit = data.habits[habitId];
-				if (!habit.completions.includes(dateISO)) {
-					habit.completions.push(dateISO);
-					completionsRestored++;
+
+				if (
+					habit.kind === "counter" &&
+					typeof value === "number" &&
+					value > 0
+				) {
+					// Restore counter count for this date
+					if (!habit.counts) habit.counts = {};
+					const existing = habit.counts[dateISO] ?? 0;
+					if (value > existing) {
+						habit.counts[dateISO] = value;
+						completionsRestored++;
+					}
+					// If count meets target, also add to completions
+					const target = habit.target ?? 1;
+					if (
+						value >= target &&
+						!habit.completions.includes(dateISO)
+					) {
+						habit.completions.push(dateISO);
+					}
+				} else if (habit.kind !== "counter") {
+					// Boolean habit — restore completion
+					if (!habit.completions.includes(dateISO)) {
+						habit.completions.push(dateISO);
+						completionsRestored++;
+					}
 				}
 			}
 		}
 
-		// Sort all completion arrays after the bulk insert
 		for (const habit of Object.values(data.habits)) {
 			habit.completions = sortedUnique(habit.completions);
 		}
 
 		await this.persist();
-		await this.writeConfigBackup();
 
 		return {
 			habitsFound: discoveredKeys.size,
@@ -658,71 +935,50 @@ export class DataManager {
 	}
 
 	private parseDateFromFilename(basename: string): string | null {
-		const fmt = this.settings.dailyNoteDateFormat;
+		const fmt = "YYYY-MM-DD";
 		const parsed = moment(basename, fmt, true);
 		if (!parsed.isValid()) return null;
 		return parsed.format("YYYY-MM-DD");
 	}
 
-	// ── Config Backup (HabitTracker_Config.md) ───────────────────────────────
-
-	/**
-	 * Writes a human-readable markdown file containing all habit metadata
-	 * (colors, icons, quotes) so it's versionable in Git and readable without
-	 * the plugin. Call this after any metadata change.
-	 */
-	async writeConfigBackup(): Promise<void> {
-		if (!this.settings.enableConfigBackup) return;
-
-		const data = await this.load();
-		const habits = data.habitOrder
-			.map((id) => data.habits[id])
-			.filter(Boolean);
-
-		const lines = [
-			"# HabitTracker Config Backup",
-			"",
-			"> Auto-generated by the Habit Tracker plugin. Do not edit manually.",
-			`> Last updated: ${new Date().toLocaleString()}`,
-			"",
-			"## Habits",
-			"",
-		];
-
-		for (const h of habits) {
-			lines.push(`### ${h.name}`);
-			lines.push(`- **ID:** \`${h.id}\``);
-			lines.push(`- **Color:** \`${h.color}\``);
-			if (h.icon) lines.push(`- **Icon:** \`${h.icon}\``);
-			if (h.quote) lines.push(`- **Quote:** ${h.quote}`);
-			lines.push(`- **Created:** ${h.createdDate}`);
-			lines.push(`- **Archived:** ${h.archived}`);
-			lines.push("");
-		}
-
-		const path = normalizePath(this.settings.configBackupPath);
-		const existing = this.app.vault.getAbstractFileByPath(path);
-		const content = lines.join("\n");
-
-		if (existing instanceof TFile) {
-			await this.app.vault.modify(existing, content);
-		} else {
-			await this.app.vault.create(path, content);
-		}
-	}
-
 	// ── Heatmap data helpers ─────────────────────────────────────────────────
 
-	/**
-	 * Returns the Set of completion dates for a given year.
-	 * The Svelte heatmap component calls this to paint cells.
-	 */
 	getCompletionsForYear(habit: Habit, year: number): Set<string> {
 		const prefix = `${year}-`;
 		return new Set(habit.completions.filter((d) => d.startsWith(prefix)));
 	}
 
-	/** Returns every year that has at least one completion, plus the current year */
+	// ── Full reset ────────────────────────────────────────────────────────────
+
+	async resetAll(): Promise<void> {
+		const today = todayISO();
+		const now = new Date();
+		const logEntry = `${now.toISOString()}: Full reset performed`;
+
+		const fresh: HabitData = {
+			version: DATA_VERSION,
+			habits: {},
+			habitOrder: [],
+			uiState: {
+				openHabitIds: [],
+				selectedYear: now.getFullYear(),
+				archivedSectionOpen: false,
+			},
+			lastModified: now.toISOString(),
+			resetAt: today,
+			deletedHabitKeys: [],
+			resetLog: [logEntry],
+		};
+
+		this.cache = fresh;
+		await this.persist();
+	}
+
+	async getResetLog(): Promise<string[]> {
+		const data = await this.load();
+		return data.resetLog ?? [];
+	}
+
 	getActiveYears(habit: Habit): number[] {
 		const years = new Set<number>();
 		years.add(moment().year());

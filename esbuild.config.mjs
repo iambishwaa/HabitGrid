@@ -23,7 +23,7 @@ if (existsSync(".env.local")) {
 // If VAULT_PATH is not set, output stays in the project root (main.js).
 //
 const VAULT_PATH = process.env.VAULT_PATH ?? "";
-const PLUGIN_ID = "habit-tracker";
+const PLUGIN_ID = JSON.parse(readFileSync("manifest.json", "utf8")).id;
 
 const outDir = VAULT_PATH
 	? resolve(VAULT_PATH, ".obsidian", "plugins", PLUGIN_ID)

@@ -22,9 +22,11 @@ import {
 	DEFAULT_SETTINGS,
 	HABIT_EVENTS,
 	VIEW_TYPE_HABIT_TRACKER,
+	type Habit,
 	type HabitTrackerSettings,
 } from "./types";
 import { DataManager } from "./DataManager";
+import { generatePassphrase } from "./passphrase";
 import { HabitTrackerView } from "./HabitTrackerView";
 import HabitCreateModal from "./HabitCreateModal";
 
@@ -60,13 +62,17 @@ export default class HabitTrackerPlugin extends Plugin {
 	// Any HabitTrackerApp that writes data calls onDataChanged().
 	// All other open instances subscribe and reload their habits array.
 
-	private _listeners: Array<(sourceId: string) => void> = [];
+	private _listeners: Array<
+		(sourceId: string, updatedHabit?: Habit) => void
+	> = [];
 
-	onDataChanged(sourceId = ""): void {
-		this._listeners.forEach((fn) => fn(sourceId));
+	onDataChanged(sourceId = "", updatedHabit?: Habit): void {
+		this._listeners.forEach((fn) => fn(sourceId, updatedHabit));
 	}
 
-	onDataChangedSubscribe(fn: (sourceId: string) => void): () => void {
+	onDataChangedSubscribe(
+		fn: (sourceId: string, updatedHabit?: Habit) => void,
+	): () => void {
 		this._listeners.push(fn);
 		return () => {
 			this._listeners = this._listeners.filter((f) => f !== fn);
@@ -87,6 +93,11 @@ export default class HabitTrackerPlugin extends Plugin {
 		// 3. Boot the data layer
 		this.dataManager = new DataManager(this.app, this.settings);
 		await this.dataManager.load();
+
+		// Ensure the HabitGrid folder exists in the vault
+		this.app.workspace.onLayoutReady(async () => {
+			await this.dataManager.ensureHabitGridFolder();
+		});
 
 		// 4. Register the custom leaf view
 		this.registerView(
@@ -300,17 +311,14 @@ export default class HabitTrackerPlugin extends Plugin {
 		const onVaultChange = (file: { path: string }) => {
 			if (!file.path.endsWith(".md")) return;
 
-			// Only care about files in the Daily Notes folder
-			const folder = this.settings.dailyNotesFolder;
-			if (folder && !file.path.startsWith(folder + "/")) return;
+			// Only care about files in the HabitGrid folder
+			const habitGridFolder = this.dataManager.getHabitGridFolderPath();
+			if (!file.path.startsWith(habitGridFolder + "/")) return;
 
 			if (debounceTimer) clearTimeout(debounceTimer);
 			debounceTimer = setTimeout(() => {
-				// Invalidate the DataManager cache so the next load() re-reads disk
-				// NOTE: This is a soft invalidation — the UI only re-reads on next
-				//       explicit interaction, not automatically, to avoid jank.
 				console.log(
-					"[HabitTracker] Daily Note changed, cache flagged stale.",
+					"[HabitGrid] HabitGrid folder changed, cache flagged stale.",
 				);
 			}, 1500);
 		};
@@ -326,14 +334,8 @@ export default class HabitTrackerPlugin extends Plugin {
 	 * Called after any write operation originating from a command
 	 * (not from within the view itself, which re-renders immediately).
 	 */
-	broadcastDataChanged(): void {
-		for (const leaf of this.app.workspace.getLeavesOfType(
-			VIEW_TYPE_HABIT_TRACKER,
-		)) {
-			if (leaf.view instanceof HabitTrackerView) {
-				leaf.view.refresh();
-			}
-		}
+	broadcastDataChanged(sourceId = ""): void {
+		this.onDataChanged(sourceId);
 	}
 
 	// ── Settings persistence ─────────────────────────────────────────────────
@@ -366,90 +368,50 @@ class HabitTrackerSettingTab extends PluginSettingTab {
 
 		containerEl.createEl("h2", { text: "Habit Tracker" });
 
-		// ── Daily Notes integration ──────────────────────────────────────────
+		// ── HabitGrid folder ─────────────────────────────────────────────────
 
-		containerEl.createEl("h3", { text: "Daily Notes Sync" });
+		containerEl.createEl("h3", { text: "HabitGrid Folder" });
+
+		let folderMoveTimer: ReturnType<typeof setTimeout>;
 
 		new Setting(containerEl)
-			.setName("Sync completions to Daily Notes")
+			.setName("Folder location")
 			.setDesc(
-				"When enabled, every toggle writes a `habit_*: true` key to " +
-					"the Daily Note YAML frontmatter — creating a plain-text backup.",
+				"Where to create the HabitGrid folder inside your vault. " +
+					"Leave blank to place it at the vault root. " +
+					"Example: 'Notes' creates 'Notes/HabitGrid'. " +
+					"All date files always stay inside the HabitGrid folder.",
 			)
-			.addToggle((toggle) =>
-				toggle
-					.setValue(this.plugin.settings.syncToDailyNotes)
-					.onChange(async (value) => {
-						this.plugin.settings.syncToDailyNotes = value;
-						await this.plugin.saveSettings();
-					}),
-			);
+			.addText((text) => {
+				text.setPlaceholder("Leave blank for vault root").setValue(
+					this.plugin.settings.habitGridParentFolder,
+				);
 
-		new Setting(containerEl)
-			.setName("Daily Notes folder")
-			.setDesc(
-				"Vault-relative path to your Daily Notes folder. " +
-					"Leave blank to use vault root. Example: Journal/Daily",
-			)
-			.addText((text) =>
-				text
-					.setPlaceholder("Journal/Daily")
-					.setValue(this.plugin.settings.dailyNotesFolder)
-					.onChange(async (value) => {
-						this.plugin.settings.dailyNotesFolder = value.trim();
-						await this.plugin.saveSettings();
-					}),
-			);
+				const applyFolderChange = async () => {
+					const oldParent =
+						this.plugin.settings.habitGridParentFolder;
+					const newParent = text.getValue().trim();
+					if (oldParent === newParent) return;
+					this.plugin.settings.habitGridParentFolder = newParent;
+					await this.plugin.saveSettings();
+					this.plugin.dataManager.updateSettings(
+						this.plugin.settings,
+					);
+					await this.plugin.dataManager.moveHabitGridFolder(
+						oldParent,
+						newParent,
+					);
+					await this.plugin.dataManager.ensureHabitGridFolder();
+				};
 
-		new Setting(containerEl)
-			.setName("Daily Notes date format")
-			.setDesc(
-				"Must match your Daily Notes plugin filename format exactly. " +
-					"Default: YYYY-MM-DD",
-			)
-			.addText((text) =>
-				text
-					.setPlaceholder("YYYY-MM-DD")
-					.setValue(this.plugin.settings.dailyNoteDateFormat)
-					.onChange(async (value) => {
-						this.plugin.settings.dailyNoteDateFormat =
-							value.trim() || "YYYY-MM-DD";
-						await this.plugin.saveSettings();
-					}),
-			);
-
-		// ── Config backup ────────────────────────────────────────────────────
-
-		containerEl.createEl("h3", { text: "Config Backup" });
-
-		new Setting(containerEl)
-			.setName("Enable HabitTracker_Config.md backup")
-			.setDesc(
-				"Generates a readable markdown file with your habit metadata " +
-					"(colors, icons, quotes). Safe to commit to Git.",
-			)
-			.addToggle((toggle) =>
-				toggle
-					.setValue(this.plugin.settings.enableConfigBackup)
-					.onChange(async (value) => {
-						this.plugin.settings.enableConfigBackup = value;
-						await this.plugin.saveSettings();
-					}),
-			);
-
-		new Setting(containerEl)
-			.setName("Config backup path")
-			.setDesc("Vault-relative path for the config backup file.")
-			.addText((text) =>
-				text
-					.setPlaceholder("HabitTracker_Config.md")
-					.setValue(this.plugin.settings.configBackupPath)
-					.onChange(async (value) => {
-						this.plugin.settings.configBackupPath =
-							value.trim() || "HabitTracker_Config.md";
-						await this.plugin.saveSettings();
-					}),
-			);
+				text.inputEl.addEventListener("blur", applyFolderChange);
+				text.inputEl.addEventListener("keydown", (e) => {
+					if (e.key === "Enter") {
+						e.preventDefault();
+						text.inputEl.blur();
+					}
+				});
+			});
 
 		// ── Display ──────────────────────────────────────────────────────────
 
@@ -465,6 +427,20 @@ class HabitTrackerSettingTab extends PluginSettingTab {
 						this.plugin.settings.weekStartsOnMonday = value;
 						await this.plugin.saveSettings();
 						this.plugin.broadcastDataChanged();
+					}),
+			);
+
+		new Setting(containerEl)
+			.setName("Auto-collapse habits")
+			.setDesc(
+				"When you expand a habit, automatically collapse all others. Turn off to keep multiple habits open at once.",
+			)
+			.addToggle((toggle) =>
+				toggle
+					.setValue(this.plugin.settings.autoCollapse)
+					.onChange(async (value) => {
+						this.plugin.settings.autoCollapse = value;
+						await this.plugin.saveSettings();
 					}),
 			);
 
@@ -500,5 +476,100 @@ class HabitTrackerSettingTab extends PluginSettingTab {
 						}
 					}),
 			);
+
+		// ── Danger Zone ──────────────────────────────────────────────────────
+
+		containerEl.createEl("h3", {
+			text: "Danger Zone",
+			cls: "danger-heading",
+		});
+
+		// Show reset log if any resets have occurred
+		this.plugin.dataManager.getResetLog().then((log) => {
+			if (log.length === 0) return;
+			const logSection = containerEl.createDiv({
+				cls: "reset-log-section",
+			});
+			logSection.createEl("p", {
+				text: "Reset history:",
+				cls: "reset-log-label",
+			});
+			const ul = logSection.createEl("ul", { cls: "reset-log-list" });
+			for (const entry of log) {
+				ul.createEl("li", { text: entry, cls: "reset-log-entry" });
+			}
+		});
+
+		// Generate fresh passphrase every time settings opens
+		const passphrase = generatePassphrase();
+
+		const dangerDesc = containerEl.createDiv({ cls: "danger-zone" });
+		dangerDesc.createEl("p", {
+			text: "This permanently deletes all habits and history. Your Daily Notes are not touched.",
+			cls: "danger-text",
+		});
+
+		// Passphrase display
+		const phraseBox = dangerDesc.createDiv({ cls: "danger-phrase-box" });
+		phraseBox.createEl("span", {
+			text: "Type this phrase to confirm: ",
+			cls: "danger-phrase-label",
+		});
+		phraseBox.createEl("code", { text: passphrase, cls: "danger-phrase" });
+
+		// Input + button row
+		const dangerRow = dangerDesc.createDiv({ cls: "danger-row" });
+		const input = dangerRow.createEl("input", {
+			type: "text",
+			cls: "danger-input",
+			attr: { placeholder: "type phrase here…" },
+		});
+
+		const resetBtn = dangerRow.createEl("button", {
+			text: "Delete everything",
+			cls: "danger-btn",
+			attr: { disabled: "true" },
+		});
+
+		input.addEventListener("input", () => {
+			const matches = input.value.trim() === passphrase;
+			resetBtn.toggleAttribute("disabled", !matches);
+		});
+
+		resetBtn.addEventListener("click", async () => {
+			resetBtn.textContent = "Deleting…";
+			resetBtn.setAttribute("disabled", "true");
+			try {
+				await this.plugin.dataManager.resetAll();
+				new Notice("✓ HabitGrid data cleared. Starting fresh.");
+				this.plugin.broadcastDataChanged("__reset__");
+				input.value = "";
+				resetBtn.textContent = "Delete everything";
+			} catch (err) {
+				new Notice(`✗ Reset failed: ${err}`);
+				resetBtn.textContent = "Delete everything";
+				resetBtn.removeAttribute("disabled");
+			}
+		});
+
+		// Inline styles for danger zone (minimal, uses Obsidian vars)
+		const style = containerEl.createEl("style");
+		style.textContent = `
+      .danger-heading { color: #e53e3e; }
+      .danger-zone { border: 1px solid rgba(229,62,62,.3); border-radius: 8px; padding: 14px 16px; background: rgba(229,62,62,.04); }
+      .danger-text { margin: 0 0 10px; font-size: .85rem; color: var(--text-muted); }
+      .danger-phrase-box { margin-bottom: 10px; font-size: .83rem; }
+      .danger-phrase { background: var(--background-secondary); padding: 2px 7px; border-radius: 4px; font-size: .85rem; letter-spacing: .04em; color: #e53e3e; }
+      .danger-row { display: flex; gap: 8px; align-items: center; }
+      .danger-input { flex: 1; font-size: .83rem; background: var(--background-modifier-form-field); border: 1px solid var(--background-modifier-border); border-radius: 5px; padding: 5px 10px; color: var(--text-normal); outline: none; }
+      .danger-input:focus { border-color: #e53e3e; }
+      .danger-btn { background: #e53e3e; color: #fff; border: none; border-radius: 5px; padding: 5px 14px; font-size: .83rem; cursor: pointer; white-space: nowrap; transition: opacity 120ms; }
+      .danger-btn:disabled { opacity: .4; cursor: default; }
+      .danger-btn:not(:disabled):hover { opacity: .88; }
+      .reset-log-section { margin-bottom: 12px; padding: 10px 12px; background: var(--background-secondary); border-radius: 6px; border: 1px solid var(--background-modifier-border); }
+      .reset-log-label { margin: 0 0 6px; font-size: .78rem; font-weight: 600; color: var(--text-muted); }
+      .reset-log-list { margin: 0; padding-left: 16px; }
+      .reset-log-entry { font-size: .76rem; color: var(--text-muted); font-family: var(--font-monospace); margin-bottom: 2px; }
+    `;
 	}
 }

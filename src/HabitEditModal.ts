@@ -33,7 +33,6 @@ export default class HabitEditModal extends Modal {
 	private habitUnit: string;
 
 	private nameInputEl: HTMLInputElement | null = null;
-	private hexInputEl: HTMLInputElement | null = null;
 	private targetRow: HTMLElement | null = null;
 	private colorSwatches: HTMLElement[] = [];
 	private submitBtn: HTMLButtonElement | null = null;
@@ -193,33 +192,34 @@ export default class HabitEditModal extends Modal {
 			this.colorSwatches.push(swatch);
 		}
 
-		const hexRow = colorSection.createDiv({ cls: "hex-row" });
-		hexRow.createEl("span", { text: "#", cls: "hex-prefix" });
-		this.hexInputEl = hexRow.createEl("input", {
-			type: "text",
-			cls: "hex-input",
-			attr: {
-				placeholder: "6366f1",
-				maxlength: "6",
-				"aria-label": "Custom hex color",
-			},
-		});
-		this.hexInputEl.value = this.habitColor.replace("#", "");
-		this.hexInputEl.addEventListener("input", () => {
-			const raw = this.hexInputEl!.value.replace(/[^0-9a-fA-F]/g, "");
-			this.hexInputEl!.value = raw;
-			if (raw.length === 6) this.selectColor("#" + raw, false);
+		const hexRow = colorSection.createDiv({ cls: "color-picker-row" });
+		hexRow.createEl("span", {
+			text: "Custom color:",
+			cls: "color-picker-label",
 		});
 
-		const previewDot = colorSection.createDiv({ cls: "color-preview-dot" });
+		const colorInput = hexRow.createEl("input", {
+			type: "color",
+			cls: "color-picker-input",
+			attr: { value: this.habitColor },
+		}) as HTMLInputElement;
+
+		const previewDot = hexRow.createDiv({ cls: "color-preview-dot" });
 		previewDot.style.background = this.habitColor;
-		// Override selectColor to also update preview dot
-		const origSelect = this.selectColor.bind(this);
-		this.selectColor = (hex, updateHex?) => {
-			origSelect(hex, updateHex);
-			previewDot.style.background = this.habitColor;
+
+		colorInput.addEventListener("input", () => {
+			this.selectColor(colorInput.value, false);
+			previewDot.style.background = colorInput.value;
 			if (this.iconPreviewEl)
-				this.iconPreviewEl.style.background = this.habitColor;
+				this.iconPreviewEl.style.background = colorInput.value;
+		});
+
+		const origSelect = this.selectColor.bind(this);
+		this.selectColor = (hex, updatePicker = true) => {
+			origSelect(hex, updatePicker);
+			previewDot.style.background = hex;
+			if (updatePicker) colorInput.value = hex;
+			if (this.iconPreviewEl) this.iconPreviewEl.style.background = hex;
 		};
 
 		// ── Buttons ──

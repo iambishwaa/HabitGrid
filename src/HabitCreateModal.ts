@@ -32,7 +32,6 @@ export default class HabitCreateModal extends Modal {
 	private habitUnit = "";
 
 	private nameInputEl: HTMLInputElement | null = null;
-	private hexInputEl: HTMLInputElement | null = null;
 	private targetRow: HTMLElement | null = null;
 	private colorSwatches: HTMLElement[] = [];
 	private submitBtn: HTMLButtonElement | null = null;
@@ -162,26 +161,32 @@ export default class HabitCreateModal extends Modal {
 			this.colorSwatches.push(swatch);
 		}
 
-		const hexRow = colorSection.createDiv({ cls: "hex-row" });
-		hexRow.createEl("span", { text: "#", cls: "hex-prefix" });
-		this.hexInputEl = hexRow.createEl("input", {
-			type: "text",
-			cls: "hex-input",
-			attr: { placeholder: "6366f1", maxlength: "6" },
-		});
-		this.hexInputEl.value = this.habitColor.replace("#", "");
-		this.hexInputEl.addEventListener("input", () => {
-			const raw = this.hexInputEl!.value.replace(/[^0-9a-fA-F]/g, "");
-			this.hexInputEl!.value = raw;
-			if (raw.length === 6) this.selectColor("#" + raw, false);
+		// Native color picker — opens OS color wheel/gradient on click
+		const pickerRow = colorSection.createDiv({ cls: "color-picker-row" });
+		pickerRow.createEl("span", {
+			text: "Custom color:",
+			cls: "color-picker-label",
 		});
 
-		const previewDot = colorSection.createDiv({ cls: "color-preview-dot" });
+		const colorInput = pickerRow.createEl("input", {
+			type: "color",
+			cls: "color-picker-input",
+			attr: { value: this.habitColor },
+		}) as HTMLInputElement;
+
+		const previewDot = pickerRow.createDiv({ cls: "color-preview-dot" });
 		previewDot.style.background = this.habitColor;
+
+		colorInput.addEventListener("input", () => {
+			this.selectColor(colorInput.value, false);
+			previewDot.style.background = colorInput.value;
+		});
+
 		const origSelect = this.selectColor.bind(this);
-		this.selectColor = (hex, updateHex?) => {
-			origSelect(hex, updateHex);
-			previewDot.style.background = this.habitColor;
+		this.selectColor = (hex, updatePicker = true) => {
+			origSelect(hex, updatePicker);
+			previewDot.style.background = hex;
+			if (updatePicker) colorInput.value = hex;
 		};
 
 		// ── Buttons ──
